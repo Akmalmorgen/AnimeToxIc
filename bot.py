@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import re
 import tempfile
@@ -6,6 +7,7 @@ import shutil
 from pathlib import Path
 
 import asyncpg
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -24,7 +26,7 @@ import yt_dlp
 # ---------- КОНФИГУРАЦИЯ ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-DATABASE_URL = os.getenv("DATABASE_URL")  # Строка подключения к Neon
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # ---------- ИНИЦИАЛИЗАЦИЯ БОТА ----------
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -36,9 +38,7 @@ dp.include_router(router)
 db_pool: asyncpg.Pool = None
 
 async def init_db():
-    """Создание таблиц при первом запуске."""
     async with db_pool.acquire() as conn:
-        # Таблица пользователей
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY,
@@ -47,7 +47,6 @@ async def init_db():
                 joined_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
-        # Таблица для хранения настроек (ключ-значение)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
@@ -57,14 +56,11 @@ async def init_db():
     print("✅ База данных инициализирована.")
 
 async def get_setting(key: str):
-    """Получить значение настройки из БД."""
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT value FROM settings WHERE key = $1", key)
         return row["value"] if row else None
 
 async def set_setting(key: str, value):
-    """Сохранить значение настройки в БД."""
-    import json
     async with db_pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO settings (key, value) VALUES ($1, $2)
@@ -72,7 +68,6 @@ async def set_setting(key: str, value):
         """, key, json.dumps(value))
 
 async def add_user(user_id: int, username: str = None, first_name: str = None):
-    """Добавить пользователя, если его еще нет."""
     async with db_pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO users (user_id, username, first_name)
@@ -81,7 +76,6 @@ async def add_user(user_id: int, username: str = None, first_name: str = None):
         """, user_id, username, first_name)
 
 async def get_all_users():
-    """Получить список ID всех пользователей для рассылки."""
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT user_id FROM users")
         return [row["user_id"] for row in rows]
@@ -97,13 +91,13 @@ class AdminStates(StatesGroup):
     broadcast_photo = State()
     broadcast_preview = State()
 
-# ---------- ЦВЕТНЫЕ КНОПКИ (ХЕЛПЕР) ----------
+# ---------- ХЕЛПЕР ДЛЯ КНОПОК ----------
 def btn(text, callback_data=None, url=None, style=None):
     return InlineKeyboardButton(
         text=text,
         callback_data=callback_data,
         url=url,
-        style=style  # 'primary', 'success', 'danger'
+        style=style  # 'primary' | 'success' | 'danger'
     )
 
 # ---------- MIDDLEWARE: ОБЯЗАТЕЛЬНАЯ ПОДПИСКА ----------
@@ -123,7 +117,6 @@ class SubscriptionMiddleware:
         if isinstance(event, Message) and event.text and event.text.startswith("/start"):
             return await handler(event, data)
 
-        # Получаем настройки подписки из БД
         sub = await get_setting("subscription")
         if sub and sub.get("channel_id"):
             channel_id = sub["channel_id"]
@@ -149,14 +142,14 @@ class SubscriptionMiddleware:
                         await event.answer()
                     return
             except Exception:
-                pass  # Если бот не админ в канале, пропускаем
+                pass
 
         return await handler(event, data)
 
 dp.message.middleware(SubscriptionMiddleware())
 dp.callback_query.middleware(SubscriptionMiddleware())
 
-# ---------- ГЛАВНОЕ МЕНЮ ----------
+# ---------- КЛАВИАТУРЫ ----------
 def main_menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [btn("🖼 Поиск аниме", callback_data="menu_anime", style="primary")],
@@ -169,7 +162,7 @@ def back_kb():
         [btn("◀️ Назад", callback_data="main_menu", style="danger")]
     ])
 
-# ---------- /start ----------
+# ---------- СТАРТ ----------
 @router.message(CommandStart())
 async def start(message: Message):
     await add_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
@@ -242,15 +235,7 @@ async def handle_anime_search(message: Message):
     except Exception as e:
         await msg.edit_text(f"❌ Ошибка: {e}")
 
-# ---------- СКАЧИВАНИЕ ВИДЕО ----------
-@router.callback_query(F.data == "menu_video")
-async def video_menu(call: CallbackQuery):
-    await call.message.edit_text(
-        "📥 Отправь ссылку на видео из TikTok, Instagram или YouTube.",
-        reply_markup=back_kb()
-    )
-    await call.answer()
-
+# ---------- ССЫЛКИ (АНИМЕ ИЛИ ВИДЕО) ----------
 @router.message(F.text & F.text.regexp(r'https?://'))
 async def handle_link(message: Message):
     url = message.text.strip()
@@ -273,6 +258,15 @@ async def handle_link(message: Message):
             await msg.edit_text(f"❌ Ошибка: {e}")
     else:
         await handle_video_link(message, url)
+
+# ---------- СКАЧИВАНИЕ ВИДЕО ----------
+@router.callback_query(F.data == "menu_video")
+async def video_menu(call: CallbackQuery):
+    await call.message.edit_text(
+        "📥 Отправь ссылку на видео из TikTok, Instagram или YouTube.",
+        reply_markup=back_kb()
+    )
+    await call.answer()
 
 async def handle_video_link(message: Message, url: str):
     msg = await message.answer("⏳ Скачиваю видео...")
@@ -494,7 +488,7 @@ async def broadcast_without_btn_preview(message: Message, state: FSMContext):
     await message.copy_to(chat_id=message.chat.id)
     await message.answer("Подтверди отправку:", reply_markup=kb)
 
-# --- ПРЕДПРОСМОТР (ДЛЯ ВАРИАНТА С КНОПКОЙ) ---
+# --- ПРЕДПРОСМОТР (С КНОПКОЙ) ---
 async def show_broadcast_preview(message: Message, state: FSMContext):
     data = await state.get_data()
     text = data.get("broadcast_text", "")
@@ -552,19 +546,41 @@ async def broadcast_confirm(call: CallbackQuery, state: FSMContext):
         except Exception:
             fail += 1
 
-    await call.message.edit_text(f"✅ Рассылка завершена.\nУспешно: {success}\nОшибок: {fail}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [btn("◀️ В админку", callback_data="admin_back", style="danger")]
-    ]))
+    await call.message.edit_text(
+        f"✅ Рассылка завершена.\nУспешно: {success}\nОшибок: {fail}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [btn("◀️ В админку", callback_data="admin_back", style="danger")]
+        ])
+    )
     await state.clear()
+
+# ---------- HEALTH CHECK ДЛЯ RENDER / UPTIMEROBOT ----------
+async def health(request):
+    return web.Response(text="OK", status=200)
+
+async def start_health_server():
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+
+    port = int(os.environ.get("PORT", 10000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"✅ Health-check сервер слушает порт {port} (эндпоинт /health)")
 
 # ---------- ЗАПУСК ----------
 async def main():
     global db_pool
     print("Подключение к базе данных...")
-    # Создаем пул соединений. Neon рекомендует использовать pooler для Render.
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
     await init_db()
-    print("Бот запущен...")
+
+    # Health-check сервер для Render/UptimeRobot
+    asyncio.create_task(start_health_server())
+
+    print("Бот запущен (long polling)...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
