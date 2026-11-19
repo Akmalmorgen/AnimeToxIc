@@ -6,6 +6,7 @@ import tempfile
 import shutil
 import time
 from pathlib import Path
+import urllib.parse
 
 import asyncpg
 import aiohttp
@@ -29,34 +30,30 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 TRACEMOE_TOKEN = os.getenv("TRACEMOE_TOKEN")
-BOT_USERNAME = "Animebot1k_bot" # <-- Укажи юзернейм бота для подписи
+BOT_USERNAME = "Animebot1k_bot" # <-- Укажи юзернейм бота
 
-# ---------- АНТИСПАМ (ХРАНИЛИЩЕ В ПАМЯТИ) ----------
-# Ключ: user_id, Значение: время последнего запроса
+# ---------- АНТИСПАМ ----------
 user_last_request = {}
-SPAM_DELAY = 3  # Секунды
+SPAM_DELAY = 3
 
 async def check_spam(user_id: int) -> bool:
-    """Возвращает True, если пользователь спамит."""
     now = time.time()
-    last_time = user_last_request.get(user_id, 0)
-    if now - last_time < SPAM_DELAY:
+    if now - user_last_request.get(user_id, 0) < SPAM_DELAY:
         return True
     user_last_request[user_id] = now
     return False
 
 # ---------- АНИМАЦИЯ ЗАГРУЗКИ ----------
 async def loading_animation(message: Message, base_text: str):
-    """Асинхронная анимация ползунка."""
     bars = ["░", "▒", "▓", "█"]
     try:
-        for i in range(1, 11): # 10 шагов
+        for i in range(1, 11):
             filled = bars[min(i // 3, 3)] * i
             empty = "░" * (10 - i)
             await message.edit_text(f"{base_text}\n\n[{filled}{empty}] {i*10}%")
-            await asyncio.sleep(0.15) # Скорость анимации
+            await asyncio.sleep(0.15)
     except Exception:
-        pass # Игнорируем ошибки, если сообщение удалили
+        pass
 
 # ---------- ИНИЦИАЛИЗАЦИЯ БОТА ----------
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -64,7 +61,6 @@ dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-# ---------- ПУЛ СОЕДИНЕНИЙ С БД ----------
 db_pool: asyncpg.Pool = None
 
 async def init_db():
@@ -122,6 +118,7 @@ class AdminStates(StatesGroup):
 
 class UserStates(StatesGroup):
     waiting_music = State()
+    waiting_anime = State()
 
 # ---------- ХЕЛПЕР ДЛЯ INLINE-КНОПОК ----------
 def btn(text, callback_data=None, url=None, style=None):
@@ -139,7 +136,6 @@ class SubscriptionMiddleware:
         if isinstance(event, Message) and event.text and event.text.startswith("/start"):
             return await handler(event, data)
 
-        # Проверка на спам
         if await check_spam(user_id):
             if isinstance(event, Message):
                 await event.answer(f"⏳ Пожалуйста, не так быстро. Подожди {SPAM_DELAY} секунды.")
@@ -173,7 +169,7 @@ class SubscriptionMiddleware:
 dp.message.middleware(SubscriptionMiddleware())
 dp.callback_query.middleware(SubscriptionMiddleware())
 
-# ---------- КЛАВИАТУРЫ (REPLY И INLINE) ----------
+# ---------- КЛАВИАТУРЫ ----------
 def main_menu_reply(user_id):
     kb = [
         [KeyboardButton(text="🖼 Поиск аниме"), KeyboardButton(text="🎵 Поиск музыки")],
@@ -192,17 +188,23 @@ def cancel_inline_kb():
 def admin_cancel_kb():
     return InlineKeyboardMarkup(inline_keyboard=[[btn("❌ Отмена", callback_data="admin_back", style="danger")]])
 
-# ---------- СТАРТ И ГЛАВНОЕ МЕНЮ ----------
+def anime_lang_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [btn("🇷🇺 Русский", callback_data="set_lang_ru", style="primary"), btn("🇺🇿 O'zbekcha", callback_data="set_lang_uz", style="success")],
+        [btn("◀️ Назад в меню", callback_data="main_menu", style="danger")]
+    ])
+
+# ---------- СТАРТ ----------
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext):
     await state.clear()
     await add_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    # По умолчанию ставим русский язык, если не выбран
+    user_lang = await get_setting(f"lang_{message.from_user.id}")
+    if not user_lang: await set_setting(f"lang_{message.from_user.id}", "ru")
+    
     await message.answer(
-        "👋 <b>Привет!</b> Я — твой помощник в мире аниме и развлечений.\n\n"
-        "✨ <b>Что я умею:</b>\n"
-        "• Находить аниме по скриншоту\n"
-        "• Искать и распознавать музыку\n"
-        "• Скачивать видео из соцсетей\n\n"
+        "👋 <b>Привет!</b> Я — твой помощник.\n\n"
         "👇 Выбери нужный раздел на клавиатуре ниже:",
         reply_markup=main_menu_reply(message.from_user.id)
     )
@@ -222,6 +224,40 @@ async def check_sub_cb(call: CallbackQuery, state: FSMContext):
     await call.message.answer("🏠 <b>Главное меню</b>", reply_markup=main_menu_reply(call.from_user.id))
 
 # ---------- ПОИСК АНИМЕ ----------
+async def get_ru_title(filename):
+    """Ищет русское название на Shikimori."""
+    # Очищаем от мусора (теги, разрешения, расширения)
+    clean_title = re.sub(r'\.(S\d+E\d+|1080p|720p|BDRip|WEB-DL|mkv|mp4).*$', '', filename, flags=re.IGNORECASE)
+    clean_title = clean_title.replace('.', ' ').replace('_', ' ').strip()
+    
+    url = "https://shikimori.one/api/animes"
+    params = {"search": clean_title, "limit": 1}
+    headers = {"User-Agent": "AnimeSearchBot"} # Shikimori требует User-Agent
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, headers=headers, timeout=5) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data and len(data) > 0:
+                        return data[0].get("russian", clean_title)
+    except Exception:
+        pass
+    return clean_title
+
+async def translate_to_uz(text):
+    """Переводит текст на узбекский через бесплатный API."""
+    url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=ru&tl=uz&dt=t&q={urllib.parse.quote(text)}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=5) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return "".join([item[0] for item in data[0]])
+    except Exception:
+        pass
+    return text
+
 async def search_tracemoe_api(image_bytes, is_url=False):
     async with aiohttp.ClientSession() as session:
         url = "https://api.trace.moe/search"
@@ -241,26 +277,35 @@ async def search_tracemoe_api(image_bytes, is_url=False):
 
 @router.message(F.text == "🖼 Поиск аниме")
 async def anime_menu(message: Message, state: FSMContext):
-    await state.clear()
+    await state.set_state(UserStates.waiting_anime)
     await message.answer(
         "🖼 <b>Поиск аниме по кадру</b>\n\n"
         "📌 <b>Что нужно:</b> Отправь мне <b>полный и необрезанный</b> скриншот из аниме.\n\n"
-        "⚠️ <b>Важно:</b> Я ищу только реальные кадры из аниме. Фанарты, AI-арт и сильно обрезанные картинки я найти не смогу.",
+        "⚠️ <b>Важно:</b> Я ищу только реальные кадры из аниме. Фанарты и AI-арт я найти не смогу.\n\n"
+        "🌐 <b>Выбери язык названия:</b>",
+        reply_markup=anime_lang_kb()
+    )
+
+@router.callback_query(F.data.startswith("set_lang_"))
+async def set_lang(call: CallbackQuery, state: FSMContext):
+    lang = call.data.split("_")[-1]
+    await set_setting(f"lang_{call.from_user.id}", lang)
+    lang_name = "Русский 🇷🇺" if lang == "ru" else "O'zbekcha 🇺🇿"
+    await call.answer(f"Язык изменен на {lang_name}", show_alert=True)
+    await call.message.edit_text(
+        f"✅ Язык названий: <b>{lang_name}</b>\n\nТеперь просто отправь мне скриншот из аниме!",
         reply_markup=back_inline_kb()
     )
 
-@router.message(F.photo | F.video | F.document)
+@router.message(UserStates.waiting_anime, F.photo | F.video | F.document)
 async def handle_anime_search(message: Message, state: FSMContext):
-    if await state.get_state() == UserStates.waiting_music:
-        return await message.answer("🎵 Ты сейчас в режиме поиска музыки. Нажми «Отмена» или отправь аудио/текст.")
-
     file_id = None
     if message.photo: file_id = message.photo[-1].file_id
     elif message.video: file_id = message.video.file_id
     elif message.document and message.document.mime_type.startswith("image/"): file_id = message.document.file_id
     else: return
 
-    msg = await message.answer("🔍 <b>Анализирую кадр...</b>")
+    msg = await message.answer("🔍 <b>Ищу аниме...</b>")
     try:
         file = await bot.get_file(file_id)
         file_data = await bot.download_file(file.file_path)
@@ -271,22 +316,42 @@ async def handle_anime_search(message: Message, state: FSMContext):
             return await msg.edit_text("😔 <b>Ничего не найдено.</b>\n\nВозможно, это фанарт, AI-арт или кадр сильно обрезан.")
 
         best = result["result"][0]
+        original_filename = best.get('filename', 'Неизвестно')
+        
+        # Получаем язык пользователя
+        user_lang = await get_setting(f"lang_{message.from_user.id}") or "ru"
+        
+        await msg.edit_text("🌐 <b>Перевожу название...</b>")
+        
+        # Получаем русское название
+        ru_title = await get_ru_title(original_filename)
+        
+        if user_lang == "uz":
+            # Переводим русское название на узбекский (если есть)
+            final_title = await translate_to_uz(ru_title)
+        else:
+            final_title = ru_title
+
         text = (
-            f"🎬 <b>Аниме:</b> {best.get('filename', 'Неизвестно')}\n"
+            f"🎬 <b>Аниме:</b> {final_title}\n"
+            f"📁 <b>Оригинал:</b> <code>{original_filename}</code>\n"
             f"📺 <b>Серия:</b> {best.get('episode', '?')}\n"
             f"⏱ <b>Таймкод:</b> {int(best.get('from', 0))} сек.\n"
             f"📊 <b>Схожесть:</b> {best.get('similarity', 0) * 100:.1f}%"
         )
+        
         if best.get("video"): await message.answer_video(best["video"], caption=text)
         elif best.get("image"): await message.answer_photo(best["image"], caption=text)
         else: await message.answer(text)
+        
         await msg.delete()
-    except Exception as e: await msg.edit_text(f"❌ Ошибка: {e}")
+        
+    except Exception as e: 
+        await msg.edit_text(f"❌ Ошибка: {e}")
 
 # ---------- ССЫЛКИ (АНИМЕ) ----------
-@router.message(F.text & F.text.regexp(r'https?://'))
+@router.message(UserStates.waiting_anime, F.text & F.text.regexp(r'https?://'))
 async def handle_link(message: Message, state: FSMContext):
-    if await state.get_state() == UserStates.waiting_music: return
     url = message.text.strip()
     if re.search(r'\.(jpg|jpeg|png|gif|webp)(\?|$)', url, re.I):
         msg = await message.answer("🔍 <b>Ищу аниме по ссылке...</b>")
@@ -295,9 +360,18 @@ async def handle_link(message: Message, state: FSMContext):
         elif not result.get("result"): await msg.edit_text("😔 Ничего не найдено.")
         else:
             best = result["result"][0]
-            await msg.edit_text(f"🎬 <b>Аниме:</b> {best.get('filename')}\n📺 <b>Серия:</b> {best.get('episode')}\n⏱ <b>Таймкод:</b> {int(best.get('from', 0))} сек.")
-    else:
-        await handle_video_link(message, url)
+            original_filename = best.get('filename', 'Неизвестно')
+            user_lang = await get_setting(f"lang_{message.from_user.id}") or "ru"
+            
+            ru_title = await get_ru_title(original_filename)
+            final_title = await translate_to_uz(ru_title) if user_lang == "uz" else ru_title
+            
+            await msg.edit_text(
+                f"🎬 <b>Аниме:</b> {final_title}\n"
+                f"📁 <b>Оригинал:</b> <code>{original_filename}</code>\n"
+                f"📺 <b>Серия:</b> {best.get('episode', '?')}\n"
+                f"⏱ <b>Таймкод:</b> {int(best.get('from', 0))} сек."
+            )
 
 # ---------- СКАЧИВАНИЕ ВИДЕО ----------
 @router.message(F.text == "📥 Скачать видео")
@@ -305,30 +379,31 @@ async def video_menu(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
         "📥 <b>Скачивание видео</b>\n\n"
-        "📌 <b>Что нужно:</b> Просто отправь мне ссылку на видео из <b>YouTube, TikTok, Instagram</b> или другой соцсети.\n\n"
-        "✨ <b>Что я сделаю:</b> Скачаю видео и отправлю его тебе прямо в чат.",
+        "📌 <b>Что нужно:</b> Отправь ссылку на видео из <b>YouTube, TikTok, Instagram</b> или другой соцсети.\n\n"
+        "✨ <b>Что я сделаю:</b> Скачаю видео и отправлю прямо в чат.",
         reply_markup=back_inline_kb()
     )
 
-async def handle_video_link(message: Message, url: str):
-    msg = await message.answer("⏳ <b>Начинаю загрузку...</b>")
-    # Запускаем анимацию в фоне
-    anim_task = asyncio.create_task(loading_animation(msg, "⏳ <b>Скачиваю видео...</b>"))
+@router.message(F.text & F.text.regexp(r'https?://'))
+async def handle_any_link(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state == UserStates.waiting_music: return
+    if current_state == UserStates.waiting_anime: return
     
+    url = message.text.strip()
+    if re.search(r'\.(jpg|jpeg|png|gif|webp)(\?|$)', url, re.I): return
+    
+    msg = await message.answer("⏳ <b>Начинаю загрузку...</b>")
+    anim_task = asyncio.create_task(loading_animation(msg, "⏳ <b>Скачиваю видео...</b>"))
     tmp_dir = tempfile.mkdtemp()
     try:
-        ydl_opts = {
-            'outtmpl': os.path.join(tmp_dir, '%(title)s.%(ext)s'),
-            'format': 'best[filesize<50M]/best',
-            'quiet': True,
-            'no_warnings': True,
-        }
+        ydl_opts = {'outtmpl': os.path.join(tmp_dir, '%(title)s.%(ext)s'), 'format': 'best[filesize<50M]/best', 'quiet': True, 'no_warnings': True}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             file_path = ydl.prepare_filename(info)
             title = info.get('title', 'Видео')
 
-        anim_task.cancel() # Останавливаем анимацию
+        anim_task.cancel()
         await msg.edit_text("✅ <b>Видео готово!</b> Отправляю...")
         await message.answer_video(FSInputFile(file_path), caption=f"🎬 <b>{title}</b>\n\n📥 Скачано через @{BOT_USERNAME}")
         await msg.delete()
@@ -345,17 +420,37 @@ async def music_menu(message: Message, state: FSMContext):
     await message.answer(
         "🎵 <b>Поиск музыки</b>\n\n"
         "📌 <b>Что можно отправить:</b>\n"
-        "• 🎤 Голосовое сообщение или аудиофайл (распознаю через Shazam)\n"
-        "• 📝 Текст с названием песни (найду на YouTube)\n"
-        "• 🔗 Ссылку на видео (вытащу звук и распознаю)\n"
-        "• 🎬 Видеофайл (вытащу звук и распознаю)\n\n"
-        "Выбери любой удобный способ!",
+        "• 🎤 Голосовое или аудио (найду через Shazam)\n"
+        "• 📝 Текст (название песни, найду на YouTube)\n"
+        "• 🔗 Ссылку на видео (вытащу звук и найду)\n"
+        "• 🎬 Видеофайл (вытащу звук и найду)",
         reply_markup=cancel_inline_kb()
     )
 
 @router.message(UserStates.waiting_music, F.text)
 async def handle_music_text(message: Message, state: FSMContext):
-    if message.text.startswith("http"): return await handle_music_link(message, state)
+    if message.text.startswith("http"):
+        msg = await message.answer("🎧 <b>Анализирую ссылку...</b>")
+        anim_task = asyncio.create_task(loading_animation(msg, "🎧 <b>Скачиваю и слушаю...</b>"))
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            with yt_dlp.YoutubeDL({'format': 'bestaudio/best', 'outtmpl': os.path.join(tmp_dir, 'audio.%(ext)s'), 'quiet': True, 'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}]}) as ydl:
+                ydl.extract_info(message.text.strip(), download=True)
+                file_path = os.path.join(tmp_dir, 'audio.mp3')
+            async with Shazam() as shazam:
+                out = await shazam.recognize(file_path)
+            anim_task.cancel()
+            if not out.get("track"): return await msg.edit_text("😔 Не удалось распознать.", reply_markup=back_inline_kb())
+            track = Serialize.full_track(out).track
+            text = f"🎵 <b>{track.title}</b>\n👤 {track.subtitle}"
+            kb = InlineKeyboardMarkup(inline_keyboard=[[btn("▶️ YouTube", url=track.youtube_link, style="danger")], [btn("◀️ Назад", callback_data="main_menu", style="danger")]]) if track.youtube_link else back_inline_kb()
+            await msg.edit_text(text, reply_markup=kb)
+        except Exception as e:
+            anim_task.cancel()
+            await msg.edit_text(f"❌ Ошибка: {e}", reply_markup=back_inline_kb())
+        finally: shutil.rmtree(tmp_dir, ignore_errors=True)
+        return
+
     msg = await message.answer("🔎 <b>Ищу на YouTube...</b>")
     try:
         with yt_dlp.YoutubeDL({'default_search': 'ytsearch1', 'quiet': True, 'extract_flat': True}) as ydl:
@@ -366,27 +461,6 @@ async def handle_music_text(message: Message, state: FSMContext):
             else:
                 await msg.edit_text("😔 Ничего не найдено.", reply_markup=back_inline_kb())
     except Exception as e: await msg.edit_text(f"❌ Ошибка: {e}", reply_markup=back_inline_kb())
-
-async def handle_music_link(message: Message, state: FSMContext):
-    msg = await message.answer("🎧 <b>Анализирую ссылку...</b>")
-    anim_task = asyncio.create_task(loading_animation(msg, "🎧 <b>Скачиваю и слушаю...</b>"))
-    tmp_dir = tempfile.mkdtemp()
-    try:
-        with yt_dlp.YoutubeDL({'format': 'bestaudio/best', 'outtmpl': os.path.join(tmp_dir, 'audio.%(ext)s'), 'quiet': True, 'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}]}) as ydl:
-            ydl.extract_info(message.text.strip(), download=True)
-            file_path = os.path.join(tmp_dir, 'audio.mp3')
-        async with Shazam() as shazam:
-            out = await shazam.recognize(file_path)
-        anim_task.cancel()
-        if not out.get("track"): return await msg.edit_text("😔 Не удалось распознать песню.", reply_markup=back_inline_kb())
-        track = Serialize.full_track(out).track
-        text = f"🎵 <b>{track.title}</b>\n👤 {track.subtitle}"
-        kb = InlineKeyboardMarkup(inline_keyboard=[[btn("▶️ YouTube", url=track.youtube_link, style="danger")], [btn("◀️ Назад в меню", callback_data="main_menu", style="danger")]]) if track.youtube_link else back_inline_kb()
-        await msg.edit_text(text, reply_markup=kb)
-    except Exception as e:
-        anim_task.cancel()
-        await msg.edit_text(f"❌ Ошибка: {e}", reply_markup=back_inline_kb())
-    finally: shutil.rmtree(tmp_dir, ignore_errors=True)
 
 @router.message(UserStates.waiting_music, F.voice | F.audio | F.video)
 async def handle_music_media(message: Message, state: FSMContext):
