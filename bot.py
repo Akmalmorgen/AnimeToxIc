@@ -6,7 +6,6 @@ import tempfile
 import shutil
 import time
 from pathlib import Path
-import urllib.parse
 
 import asyncpg
 import aiohttp
@@ -30,7 +29,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 TRACEMOE_TOKEN = os.getenv("TRACEMOE_TOKEN")
-BOT_USERNAME = "Animebot1k_bot" # <-- Укажи юзернейм бота
+BOT_USERNAME = "Animebot1k_bot" # Уже вписал твой ник
 
 # ---------- АНТИСПАМ ----------
 user_last_request = {}
@@ -188,21 +187,11 @@ def cancel_inline_kb():
 def admin_cancel_kb():
     return InlineKeyboardMarkup(inline_keyboard=[[btn("❌ Отмена", callback_data="admin_back", style="danger")]])
 
-def anime_lang_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [btn("🇷🇺 Русский", callback_data="set_lang_ru", style="primary"), btn("🇺🇿 O'zbekcha", callback_data="set_lang_uz", style="success")],
-        [btn("◀️ Назад в меню", callback_data="main_menu", style="danger")]
-    ])
-
 # ---------- СТАРТ ----------
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext):
     await state.clear()
     await add_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
-    # По умолчанию ставим русский язык, если не выбран
-    user_lang = await get_setting(f"lang_{message.from_user.id}")
-    if not user_lang: await set_setting(f"lang_{message.from_user.id}", "ru")
-    
     await message.answer(
         "👋 <b>Привет!</b> Я — твой помощник.\n\n"
         "👇 Выбери нужный раздел на клавиатуре ниже:",
@@ -223,16 +212,15 @@ async def check_sub_cb(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text("✅ Отлично! Доступ открыт.")
     await call.message.answer("🏠 <b>Главное меню</b>", reply_markup=main_menu_reply(call.from_user.id))
 
-# ---------- ПОИСК АНИМЕ ----------
+# ---------- ПОИСК АНИМЕ (ТОЛЬКО RU) ----------
 async def get_ru_title(filename):
     """Ищет русское название на Shikimori."""
-    # Очищаем от мусора (теги, разрешения, расширения)
     clean_title = re.sub(r'\.(S\d+E\d+|1080p|720p|BDRip|WEB-DL|mkv|mp4).*$', '', filename, flags=re.IGNORECASE)
     clean_title = clean_title.replace('.', ' ').replace('_', ' ').strip()
     
     url = "https://shikimori.one/api/animes"
     params = {"search": clean_title, "limit": 1}
-    headers = {"User-Agent": "AnimeSearchBot"} # Shikimori требует User-Agent
+    headers = {"User-Agent": "AnimeSearchBot"}
     
     try:
         async with aiohttp.ClientSession() as session:
@@ -244,19 +232,6 @@ async def get_ru_title(filename):
     except Exception:
         pass
     return clean_title
-
-async def translate_to_uz(text):
-    """Переводит текст на узбекский через бесплатный API."""
-    url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=ru&tl=uz&dt=t&q={urllib.parse.quote(text)}"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=5) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return "".join([item[0] for item in data[0]])
-    except Exception:
-        pass
-    return text
 
 async def search_tracemoe_api(image_bytes, is_url=False):
     async with aiohttp.ClientSession() as session:
@@ -281,19 +256,7 @@ async def anime_menu(message: Message, state: FSMContext):
     await message.answer(
         "🖼 <b>Поиск аниме по кадру</b>\n\n"
         "📌 <b>Что нужно:</b> Отправь мне <b>полный и необрезанный</b> скриншот из аниме.\n\n"
-        "⚠️ <b>Важно:</b> Я ищу только реальные кадры из аниме. Фанарты и AI-арт я найти не смогу.\n\n"
-        "🌐 <b>Выбери язык названия:</b>",
-        reply_markup=anime_lang_kb()
-    )
-
-@router.callback_query(F.data.startswith("set_lang_"))
-async def set_lang(call: CallbackQuery, state: FSMContext):
-    lang = call.data.split("_")[-1]
-    await set_setting(f"lang_{call.from_user.id}", lang)
-    lang_name = "Русский 🇷🇺" if lang == "ru" else "O'zbekcha 🇺🇿"
-    await call.answer(f"Язык изменен на {lang_name}", show_alert=True)
-    await call.message.edit_text(
-        f"✅ Язык названий: <b>{lang_name}</b>\n\nТеперь просто отправь мне скриншот из аниме!",
+        "⚠️ <b>Важно:</b> Я ищу только реальные кадры из аниме. Фанарты и AI-арт я найти не смогу.",
         reply_markup=back_inline_kb()
     )
 
@@ -318,22 +281,11 @@ async def handle_anime_search(message: Message, state: FSMContext):
         best = result["result"][0]
         original_filename = best.get('filename', 'Неизвестно')
         
-        # Получаем язык пользователя
-        user_lang = await get_setting(f"lang_{message.from_user.id}") or "ru"
-        
         await msg.edit_text("🌐 <b>Перевожу название...</b>")
-        
-        # Получаем русское название
         ru_title = await get_ru_title(original_filename)
-        
-        if user_lang == "uz":
-            # Переводим русское название на узбекский (если есть)
-            final_title = await translate_to_uz(ru_title)
-        else:
-            final_title = ru_title
 
         text = (
-            f"🎬 <b>Аниме:</b> {final_title}\n"
+            f"🎬 <b>Аниме:</b> {ru_title}\n"
             f"📁 <b>Оригинал:</b> <code>{original_filename}</code>\n"
             f"📺 <b>Серия:</b> {best.get('episode', '?')}\n"
             f"⏱ <b>Таймкод:</b> {int(best.get('from', 0))} сек.\n"
@@ -345,7 +297,6 @@ async def handle_anime_search(message: Message, state: FSMContext):
         else: await message.answer(text)
         
         await msg.delete()
-        
     except Exception as e: 
         await msg.edit_text(f"❌ Ошибка: {e}")
 
@@ -361,13 +312,9 @@ async def handle_link(message: Message, state: FSMContext):
         else:
             best = result["result"][0]
             original_filename = best.get('filename', 'Неизвестно')
-            user_lang = await get_setting(f"lang_{message.from_user.id}") or "ru"
-            
             ru_title = await get_ru_title(original_filename)
-            final_title = await translate_to_uz(ru_title) if user_lang == "uz" else ru_title
-            
             await msg.edit_text(
-                f"🎬 <b>Аниме:</b> {final_title}\n"
+                f"🎬 <b>Аниме:</b> {ru_title}\n"
                 f"📁 <b>Оригинал:</b> <code>{original_filename}</code>\n"
                 f"📺 <b>Серия:</b> {best.get('episode', '?')}\n"
                 f"⏱ <b>Таймкод:</b> {int(best.get('from', 0))} сек."
@@ -387,8 +334,7 @@ async def video_menu(message: Message, state: FSMContext):
 @router.message(F.text & F.text.regexp(r'https?://'))
 async def handle_any_link(message: Message, state: FSMContext):
     current_state = await state.get_state()
-    if current_state == UserStates.waiting_music: return
-    if current_state == UserStates.waiting_anime: return
+    if current_state in [UserStates.waiting_music, UserStates.waiting_anime]: return
     
     url = message.text.strip()
     if re.search(r'\.(jpg|jpeg|png|gif|webp)(\?|$)', url, re.I): return
