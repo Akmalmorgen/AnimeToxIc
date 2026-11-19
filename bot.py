@@ -27,6 +27,7 @@ import yt_dlp
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
+TRACEMOE_TOKEN = os.getenv("TRACEMOE_TOKEN") # Необязательно, но желательно
 
 # ---------- ИНИЦИАЛИЗАЦИЯ БОТА ----------
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -208,8 +209,9 @@ async def handle_anime_search(message: Message):
             await bot.download_file(file.file_path, tmp.name)
             tmp_path = tmp.name
 
-        async with TraceMoe() as api:
-            result = await api.search(tmp_path)
+        # Безопасная инициализация с токеном (если None, работает по IP)
+        api = TraceMoe(token=TRACEMOE_TOKEN)
+        result = await api.search(tmp_path)
 
         os.unlink(tmp_path)
 
@@ -242,8 +244,9 @@ async def handle_link(message: Message):
     if re.search(r'\.(jpg|jpeg|png|gif|webp)(\?|$)', url, re.I):
         msg = await message.answer("🔍 Ищу аниме по ссылке...")
         try:
-            async with TraceMoe() as api:
-                result = await api.search(url, is_url=True)
+            api = TraceMoe(token=TRACEMOE_TOKEN)
+            result = await api.search(url, is_url=True)
+            
             if result.result:
                 best = result.result[0]
                 text = (
