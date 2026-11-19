@@ -16,7 +16,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    FSInputFile, ReplyKeyboardMarkup, KeyboardButton
+    FSInputFile, ReplyKeyboardMarkup, KeyboardButton, BotCommand
 )
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -29,7 +29,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 TRACEMOE_TOKEN = os.getenv("TRACEMOE_TOKEN")
-BOT_USERNAME = "Animebot1k_bot" # Уже вписал твой ник
+BOT_USERNAME = "Animebot1k_bot"
 
 # ---------- АНТИСПАМ ----------
 user_last_request = {}
@@ -187,16 +187,37 @@ def cancel_inline_kb():
 def admin_cancel_kb():
     return InlineKeyboardMarkup(inline_keyboard=[[btn("❌ Отмена", callback_data="admin_back", style="danger")]])
 
-# ---------- СТАРТ ----------
+# ---------- УСТАНОВКА КОМАНД (ТОЛЬКО START) ----------
+async def set_commands(bot: Bot):
+    commands = [
+        BotCommand(command="start", description="🚀 Запустить бота")
+    ]
+    await bot.set_my_commands(commands)
+
+# ---------- СТАРТ (ЯРКОЕ ПРИВЕТСТВИЕ) ----------
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext):
     await state.clear()
     await add_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
-    await message.answer(
-        "👋 <b>Привет!</b> Я — твой помощник.\n\n"
-        "👇 Выбери нужный раздел на клавиатуре ниже:",
-        reply_markup=main_menu_reply(message.from_user.id)
-    )
+    
+    welcome_text = (
+        "✨ <b>ДОБРО ПОЖАЛОВАТЬ В ANIME HUNTER!</b> ✨\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🎌 Привет, <b>{name}</b>! Я твой ультимативный помощник в мире аниме и развлечений. "
+        "Моя база данных огромна, а скорость работы — молниеносна! ⚡️\n\n"
+        "🔥 <b>ЧТО Я УМЕЮ:</b>\n"
+        "┣ 🖼 <b>Поиск аниме</b> — найду тайтл по скриншоту (с русским названием!)\n"
+        "┣ 🎵 <b>Поиск музыки</b> — распознаю трек по звуку, тексту или видео\n"
+        "┗ 📥 <b>Скачивание видео</b> — скачаю видос из TikTok, Inst, YT\n\n"
+        "🛡 <b>ПОЧЕМУ Я?</b>\n"
+        "• Работаю 24/7 без сбоев\n"
+        "• Абсолютно бесплатно\n"
+        "• Без рекламы и ограничений\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "👇 <i>Жми на кнопки внизу и начинай пользоваться!</i>"
+    ).format(name=message.from_user.first_name)
+
+    await message.answer(welcome_text, reply_markup=main_menu_reply(message.from_user.id))
 
 @router.callback_query(F.data == "main_menu")
 async def main_menu_handler(call: CallbackQuery, state: FSMContext):
@@ -214,14 +235,11 @@ async def check_sub_cb(call: CallbackQuery, state: FSMContext):
 
 # ---------- ПОИСК АНИМЕ (ТОЛЬКО RU) ----------
 async def get_ru_title(filename):
-    """Ищет русское название на Shikimori."""
     clean_title = re.sub(r'\.(S\d+E\d+|1080p|720p|BDRip|WEB-DL|mkv|mp4).*$', '', filename, flags=re.IGNORECASE)
     clean_title = clean_title.replace('.', ' ').replace('_', ' ').strip()
-    
     url = "https://shikimori.one/api/animes"
     params = {"search": clean_title, "limit": 1}
     headers = {"User-Agent": "AnimeSearchBot"}
-    
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params, headers=headers, timeout=5) as resp:
@@ -618,6 +636,9 @@ async def main():
     print("Подключение к базе данных...")
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
     await init_db()
+    
+    await set_commands(bot)
+    
     asyncio.create_task(start_health_server())
     print("Бот запущен (long polling)...")
     await dp.start_polling(bot)
