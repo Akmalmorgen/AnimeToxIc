@@ -201,7 +201,7 @@ async def start(message: Message, state: FSMContext):
     await add_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
     
     welcome_text = (
-        "✨ <b>ДОБРО ПОЖАЛОВАТЬ В ANIME HUNTER!</b> ✨\n"
+        "✨ <b>ДОБРО ПОЖАЛОВАТЬ В Аниʍᴇ Пᴏиᴄᴋ | Муɜыᴋᴀ!</b> ✨\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         "🎌 Привет, <b>{name}</b>! Я твой ультимативный помощник в мире аниме и развлечений. "
         "Моя база данных огромна, а скорость работы — молниеносна! ⚡️\n\n"
