@@ -29,7 +29,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 TRACEMOE_TOKEN = os.getenv("TRACEMOE_TOKEN")
-BOT_USERNAME = "Animebot1k_bot" # Твой никнейм
+BOT_USERNAME = "Animebot1k_bot"
 
 # ---------- АНТИСПАМ ----------
 user_last_request = {}
@@ -203,7 +203,7 @@ async def start(message: Message, state: FSMContext):
         "✨ Добро пожаловать в <b>Аниʍᴇ Пᴏиᴄᴋ | Муɜыᴋᴀ</b>!\n\n"
         "👋 Привет, <b>{name}</b>!\n\n"
         "Я помогу найти аниме по кадру и распознать любой трек.\n\n"
-        "🖼 <b>Аниме</b> — кидай скриншот\n"
+        "🖼 <b>Аниме</b> — кидай скриншот или видео\n"
         "🎵 <b>Музыка</b> — отправь голосовое, видео или просто напиши название песни\n\n"
         "👇 Выбирай нужную кнопку внизу:"
     ).format(name=message.from_user.first_name)
@@ -224,12 +224,30 @@ async def check_sub_cb(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text("✅ Отлично! Доступ открыт.")
     await call.message.answer("🏠 <b>Главное меню</b>", reply_markup=main_menu_reply(call.from_user.id))
 
-# ---------- ПОИСК АНИМЕ ----------
-async def get_ru_title(filename):
-    clean_title = re.sub(r'\.(S\d+E\d+|1080p|720p|BDRip|WEB-DL|mkv|mp4).*$', '', filename, flags=re.IGNORECASE)
-    clean_title = clean_title.replace('.', ' ').replace('_', ' ').strip()
+# ---------- ПОИСК АНИМЕ (С КРАСИВОЙ ОБЛОЖКОЙ) ----------
+async def get_ru_title(anime_data):
+    title = None
+    year = None
+    
+    if anime_data.get("anilist") and isinstance(anime_data["anilist"], dict):
+        anilist_info = anime_data["anilist"]
+        title = anilist_info.get("title", {}).get("english") or anilist_info.get("title", {}).get("romaji")
+        year = anilist_info.get("seasonYear")
+    
+    if not title:
+        filename = anime_data.get('filename', '')
+        clean_name = re.sub(r'\[.*?\]|\(.*?\)|\.(mkv|mp4|avi|S\d+E\d+|1080p|720p).*$', '', filename, flags=re.IGNORECASE)
+        clean_name = re.sub(r' - \d+$', '', clean_name).strip()
+        title = clean_name
+
+    if not title:
+        return "Неизвестно"
+
     url = "https://shikimori.one/api/animes"
-    params = {"search": clean_title, "limit": 1}
+    params = {"search": title, "limit": 5}
+    if year:
+        params["year"] = year
+        
     headers = {"User-Agent": "AnimeSearchBot"}
     try:
         async with aiohttp.ClientSession() as session:
@@ -237,10 +255,14 @@ async def get_ru_title(filename):
                 if resp.status == 200:
                     data = await resp.json()
                     if data and len(data) > 0:
-                        return data[0].get("russian", clean_title)
+                        if year:
+                            for anime in data:
+                                if anime.get("year") == year:
+                                    return anime.get("russian", title)
+                        return data[0].get("russian", title)
     except Exception:
         pass
-    return clean_title
+    return title
 
 async def search_tracemoe_api(image_bytes, is_url=False):
     async with aiohttp.ClientSession() as session:
@@ -264,7 +286,7 @@ async def anime_menu(message: Message, state: FSMContext):
     await state.set_state(UserStates.waiting_anime)
     await message.answer(
         "🖼 <b>Поиск аниме по кадру</b>\n\n"
-        "📌 <b>Что нужно:</b> Отправь мне <b>полный и необрезанный</b> скриншот из аниме.\n\n"
+        "📌 <b>Что нужно:</b> Отправь мне <b>скриншот</b> или <b>видео</b> из аниме.\n\n"
         "⚠️ <b>Важно:</b> Я ищу только реальные кадры из аниме. Фанарты и AI-арт я найти не смогу.",
         reply_markup=back_inline_kb()
     )
@@ -272,16 +294,43 @@ async def anime_menu(message: Message, state: FSMContext):
 @router.message(UserStates.waiting_anime, F.photo | F.video | F.document)
 async def handle_anime_search(message: Message, state: FSMContext):
     file_id = None
-    if message.photo: file_id = message.photo[-1].file_id
-    elif message.video: file_id = message.video.file_id
-    elif message.document and message.document.mime_type.startswith("image/"): file_id = message.document.file_id
-    else: return
+    is_video = False
+    
+    if message.photo: 
+        file_id = message.photo[-1].file_id
+    elif message.video: 
+        file_id = message.video.file_id
+        is_video = True
+    elif message.document and message.document.mime_type.startswith("image/"): 
+        file_id = message.document.file_id
+    else: 
+        return
 
     msg = await message.answer("🔍 <b>Ищу аниме...</b>")
+    tmp_dir = tempfile.mkdtemp()
+    
     try:
         file = await bot.get_file(file_id)
-        file_data = await bot.download_file(file.file_path)
-        result = await search_tracemoe_api(file_data.read())
+        input_path = os.path.join(tmp_dir, "input_file")
+        await bot.download_file(file.file_path, input_path)
+
+        # Если это видео — вырезаем кадр
+        if is_video:
+            await msg.edit_text("🎬 <b>Извлекаю кадр из видео...</b>")
+            frame_path = os.path.join(tmp_dir, "frame.jpg")
+            # Берем кадр на 1 секунде
+            os.system(f"ffmpeg -i {input_path} -ss 00:00:01.000 -vframes 1 -q:v 2 {frame_path} -y -loglevel quiet")
+            # Если видео короче 1 секунды, берем самый первый кадр
+            if not os.path.exists(frame_path) or os.path.getsize(frame_path) == 0:
+                os.system(f"ffmpeg -i {input_path} -vframes 1 {frame_path} -y -loglevel quiet")
+            
+            with open(frame_path, "rb") as f:
+                image_to_search = f.read()
+        else:
+            with open(input_path, "rb") as f:
+                image_to_search = f.read()
+
+        result = await search_tracemoe_api(image_to_search)
 
         if result.get("error"): return await msg.edit_text(f"❌ Ошибка: {result['error']}")
         if not result.get("result"):
@@ -291,7 +340,7 @@ async def handle_anime_search(message: Message, state: FSMContext):
         original_filename = best.get('filename', 'Неизвестно')
         
         await msg.edit_text("🌐 <b>Перевожу название...</b>")
-        ru_title = await get_ru_title(original_filename)
+        ru_title = await get_ru_title(best)
 
         text = (
             f"🎬 <b>Аниме:</b> {ru_title}\n"
@@ -301,13 +350,24 @@ async def handle_anime_search(message: Message, state: FSMContext):
             f"📊 <b>Схожесть:</b> {best.get('similarity', 0) * 100:.1f}%"
         )
         
-        if best.get("video"): await message.answer_video(best["video"], caption=text)
-        elif best.get("image"): await message.answer_photo(best["image"], caption=text)
-        else: await message.answer(text)
+        # Отправляем красивую обложку (постер) вместо уродливого видео
+        cover_url = None
+        if best.get("anilist") and isinstance(best["anilist"], dict):
+            cover_url = best["anilist"].get("coverImage", {}).get("large")
+
+        if cover_url:
+            await message.answer_photo(cover_url, caption=text)
+        elif best.get("image"):
+            await message.answer_photo(best["image"], caption=text)
+        else:
+            await message.answer(text)
         
         await msg.delete()
+        
     except Exception as e: 
         await msg.edit_text(f"❌ Ошибка: {e}")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 # ---------- ССЫЛКИ (АНИМЕ) ----------
 @router.message(UserStates.waiting_anime, F.text & F.text.regexp(r'https?://'))
@@ -321,7 +381,7 @@ async def handle_anime_link(message: Message, state: FSMContext):
         else:
             best = result["result"][0]
             original_filename = best.get('filename', 'Неизвестно')
-            ru_title = await get_ru_title(original_filename)
+            ru_title = await get_ru_title(best)
             await msg.edit_text(
                 f"🎬 <b>Аниме:</b> {ru_title}\n"
                 f"📁 <b>Оригинал:</b> <code>{original_filename}</code>\n"
