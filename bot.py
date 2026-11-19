@@ -5,6 +5,7 @@ import re
 import tempfile
 import shutil
 import time
+import urllib.parse
 from pathlib import Path
 
 import asyncpg
@@ -16,20 +17,19 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    FSInputFile, ReplyKeyboardMarkup, KeyboardButton, BotCommand
+    FSInputFile, ReplyKeyboardMarkup, KeyboardButton, BotCommand, URLInputFile
 )
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
 from shazamio import Shazam, Serialize
-import yt_dlp
 
 # ---------- КОНФИГУРАЦИЯ ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 TRACEMOE_TOKEN = os.getenv("TRACEMOE_TOKEN")
-BOT_USERNAME = "Animebot1k_bot"
+BOT_USERNAME = "Animebot1k_bot" # Твой никнейм
 
 # ---------- АНТИСПАМ ----------
 user_last_request = {}
@@ -171,8 +171,7 @@ dp.callback_query.middleware(SubscriptionMiddleware())
 # ---------- КЛАВИАТУРЫ ----------
 def main_menu_reply(user_id):
     kb = [
-        [KeyboardButton(text="🖼 Поиск аниме"), KeyboardButton(text="🎵 Поиск музыки")],
-        [KeyboardButton(text="📥 Скачать видео")]
+        [KeyboardButton(text="🖼 Поиск аниме"), KeyboardButton(text="🎵 Поиск музыки")]
     ]
     if user_id == ADMIN_ID:
         kb.append([KeyboardButton(text="🛠 Админка")])
@@ -187,34 +186,26 @@ def cancel_inline_kb():
 def admin_cancel_kb():
     return InlineKeyboardMarkup(inline_keyboard=[[btn("❌ Отмена", callback_data="admin_back", style="danger")]])
 
-# ---------- УСТАНОВКА КОМАНД (ТОЛЬКО START) ----------
+# ---------- УСТАНОВКА КОМАНД ----------
 async def set_commands(bot: Bot):
     commands = [
         BotCommand(command="start", description="🚀 Запустить бота")
     ]
     await bot.set_my_commands(commands)
 
-# ---------- СТАРТ (ЯРКОЕ ПРИВЕТСТВИЕ) ----------
+# ---------- СТАРТ ----------
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext):
     await state.clear()
     await add_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
     
     welcome_text = (
-        "✨ <b>ДОБРО ПОЖАЛОВАТЬ В Аниʍᴇ Пᴏиᴄᴋ | Муɜыᴋᴀ!</b> ✨\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "🎌 Привет, <b>{name}</b>! Я твой ультимативный помощник в мире аниме и развлечений. "
-        "Моя база данных огромна, а скорость работы — молниеносна! ⚡️\n\n"
-        "🔥 <b>ЧТО Я УМЕЮ:</b>\n"
-        "┣ 🖼 <b>Поиск аниме</b> — найду тайтл по скриншоту (с русским названием!)\n"
-        "┣ 🎵 <b>Поиск музыки</b> — распознаю трек по звуку, тексту или видео\n"
-        "┗ 📥 <b>Скачивание видео</b> — скачаю видос из TikTok, Inst, YT\n\n"
-        "🛡 <b>ПОЧЕМУ Я?</b>\n"
-        "• Работаю 24/7 без сбоев\n"
-        "• Абсолютно бесплатно\n"
-        "• Без рекламы и ограничений\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "👇 <i>Жми на кнопки внизу и начинай пользоваться!</i>"
+        "✨ Добро пожаловать в <b>Аниʍᴇ Пᴏиᴄᴋ | Муɜыᴋᴀ</b>!\n\n"
+        "👋 Привет, <b>{name}</b>!\n\n"
+        "Я помогу найти аниме по кадру и распознать любой трек.\n\n"
+        "🖼 <b>Аниме</b> — кидай скриншот\n"
+        "🎵 <b>Музыка</b> — отправь голосовое, видео или просто напиши название песни\n\n"
+        "👇 Выбирай нужную кнопку внизу:"
     ).format(name=message.from_user.first_name)
 
     await message.answer(welcome_text, reply_markup=main_menu_reply(message.from_user.id))
@@ -233,7 +224,7 @@ async def check_sub_cb(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text("✅ Отлично! Доступ открыт.")
     await call.message.answer("🏠 <b>Главное меню</b>", reply_markup=main_menu_reply(call.from_user.id))
 
-# ---------- ПОИСК АНИМЕ (ТОЛЬКО RU) ----------
+# ---------- ПОИСК АНИМЕ ----------
 async def get_ru_title(filename):
     clean_title = re.sub(r'\.(S\d+E\d+|1080p|720p|BDRip|WEB-DL|mkv|mp4).*$', '', filename, flags=re.IGNORECASE)
     clean_title = clean_title.replace('.', ' ').replace('_', ' ').strip()
@@ -320,7 +311,7 @@ async def handle_anime_search(message: Message, state: FSMContext):
 
 # ---------- ССЫЛКИ (АНИМЕ) ----------
 @router.message(UserStates.waiting_anime, F.text & F.text.regexp(r'https?://'))
-async def handle_link(message: Message, state: FSMContext):
+async def handle_anime_link(message: Message, state: FSMContext):
     url = message.text.strip()
     if re.search(r'\.(jpg|jpeg|png|gif|webp)(\?|$)', url, re.I):
         msg = await message.answer("🔍 <b>Ищу аниме по ссылке...</b>")
@@ -338,45 +329,6 @@ async def handle_link(message: Message, state: FSMContext):
                 f"⏱ <b>Таймкод:</b> {int(best.get('from', 0))} сек."
             )
 
-# ---------- СКАЧИВАНИЕ ВИДЕО ----------
-@router.message(F.text == "📥 Скачать видео")
-async def video_menu(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer(
-        "📥 <b>Скачивание видео</b>\n\n"
-        "📌 <b>Что нужно:</b> Отправь ссылку на видео из <b>YouTube, TikTok, Instagram</b> или другой соцсети.\n\n"
-        "✨ <b>Что я сделаю:</b> Скачаю видео и отправлю прямо в чат.",
-        reply_markup=back_inline_kb()
-    )
-
-@router.message(F.text & F.text.regexp(r'https?://'))
-async def handle_any_link(message: Message, state: FSMContext):
-    current_state = await state.get_state()
-    if current_state in [UserStates.waiting_music, UserStates.waiting_anime]: return
-    
-    url = message.text.strip()
-    if re.search(r'\.(jpg|jpeg|png|gif|webp)(\?|$)', url, re.I): return
-    
-    msg = await message.answer("⏳ <b>Начинаю загрузку...</b>")
-    anim_task = asyncio.create_task(loading_animation(msg, "⏳ <b>Скачиваю видео...</b>"))
-    tmp_dir = tempfile.mkdtemp()
-    try:
-        ydl_opts = {'outtmpl': os.path.join(tmp_dir, '%(title)s.%(ext)s'), 'format': 'best[filesize<50M]/best', 'quiet': True, 'no_warnings': True}
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            file_path = ydl.prepare_filename(info)
-            title = info.get('title', 'Видео')
-
-        anim_task.cancel()
-        await msg.edit_text("✅ <b>Видео готово!</b> Отправляю...")
-        await message.answer_video(FSInputFile(file_path), caption=f"🎬 <b>{title}</b>\n\n📥 Скачано через @{BOT_USERNAME}")
-        await msg.delete()
-    except Exception as e:
-        anim_task.cancel()
-        await msg.edit_text(f"❌ Не удалось скачать видео: {e}")
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
 # ---------- ПОИСК МУЗЫКИ ----------
 @router.message(F.text == "🎵 Поиск музыки")
 async def music_menu(message: Message, state: FSMContext):
@@ -384,9 +336,8 @@ async def music_menu(message: Message, state: FSMContext):
     await message.answer(
         "🎵 <b>Поиск музыки</b>\n\n"
         "📌 <b>Что можно отправить:</b>\n"
+        "• 📝 <b>Название песни</b> (текстом)\n"
         "• 🎤 Голосовое или аудио (найду через Shazam)\n"
-        "• 📝 Текст (название песни, найду на YouTube)\n"
-        "• 🔗 Ссылку на видео (вытащу звук и найду)\n"
         "• 🎬 Видеофайл (вытащу звук и найду)",
         reply_markup=cancel_inline_kb()
     )
@@ -394,37 +345,38 @@ async def music_menu(message: Message, state: FSMContext):
 @router.message(UserStates.waiting_music, F.text)
 async def handle_music_text(message: Message, state: FSMContext):
     if message.text.startswith("http"):
-        msg = await message.answer("🎧 <b>Анализирую ссылку...</b>")
-        anim_task = asyncio.create_task(loading_animation(msg, "🎧 <b>Скачиваю и слушаю...</b>"))
-        tmp_dir = tempfile.mkdtemp()
-        try:
-            with yt_dlp.YoutubeDL({'format': 'bestaudio/best', 'outtmpl': os.path.join(tmp_dir, 'audio.%(ext)s'), 'quiet': True, 'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}]}) as ydl:
-                ydl.extract_info(message.text.strip(), download=True)
-                file_path = os.path.join(tmp_dir, 'audio.mp3')
-            async with Shazam() as shazam:
-                out = await shazam.recognize(file_path)
-            anim_task.cancel()
-            if not out.get("track"): return await msg.edit_text("😔 Не удалось распознать.", reply_markup=back_inline_kb())
-            track = Serialize.full_track(out).track
-            text = f"🎵 <b>{track.title}</b>\n👤 {track.subtitle}"
-            kb = InlineKeyboardMarkup(inline_keyboard=[[btn("▶️ YouTube", url=track.youtube_link, style="danger")], [btn("◀️ Назад", callback_data="main_menu", style="danger")]]) if track.youtube_link else back_inline_kb()
-            await msg.edit_text(text, reply_markup=kb)
-        except Exception as e:
-            anim_task.cancel()
-            await msg.edit_text(f"❌ Ошибка: {e}", reply_markup=back_inline_kb())
-        finally: shutil.rmtree(tmp_dir, ignore_errors=True)
-        return
-
-    msg = await message.answer("🔎 <b>Ищу на YouTube...</b>")
+        return await message.answer("🔗 Отправка ссылок отключена. Отправь название песни текстом или аудио.", reply_markup=cancel_inline_kb())
+    
+    msg = await message.answer("🔎 <b>Ищу трек...</b>")
     try:
-        with yt_dlp.YoutubeDL({'default_search': 'ytsearch1', 'quiet': True, 'extract_flat': True}) as ydl:
-            info = ydl.extract_info(f"ytsearch1:{message.text}", download=False)
-            if info.get('entries'):
-                video = info['entries'][0]
-                await msg.edit_text(f"🎵 <b>Найдено:</b>\n{video.get('title')}\n\n🔗 <a href='{video.get('url')}'>Ссылка на YouTube</a>", reply_markup=back_inline_kb())
-            else:
-                await msg.edit_text("😔 Ничего не найдено.", reply_markup=back_inline_kb())
-    except Exception as e: await msg.edit_text(f"❌ Ошибка: {e}", reply_markup=back_inline_kb())
+        url = f"https://api.deezer.com/search?q={urllib.parse.quote(message.text)}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("data"):
+                        track = data["data"][0]
+                        title = track["title"]
+                        artist = track["artist"]["name"]
+                        preview = track.get("preview")
+                        cover = track["album"]["cover_medium"]
+
+                        if preview:
+                            await message.answer_audio(
+                                audio=URLInputFile(preview, filename=f"{artist} - {title}.mp3"),
+                                title=title,
+                                performer=artist,
+                                thumb=URLInputFile(cover)
+                            )
+                            await msg.delete()
+                        else:
+                            await msg.edit_text(f"🎵 <b>{title}</b>\n👤 {artist}\n\n<i>Превью недоступно для этого трека.</i>", reply_markup=back_inline_kb())
+                    else:
+                        await msg.edit_text("😔 Ничего не найдено.", reply_markup=back_inline_kb())
+                else:
+                    await msg.edit_text("❌ Ошибка API поиска музыки.", reply_markup=back_inline_kb())
+    except Exception as e:
+        await msg.edit_text(f"❌ Ошибка: {e}", reply_markup=back_inline_kb())
 
 @router.message(UserStates.waiting_music, F.voice | F.audio | F.video)
 async def handle_music_media(message: Message, state: FSMContext):
