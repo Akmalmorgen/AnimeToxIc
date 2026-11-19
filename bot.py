@@ -224,7 +224,7 @@ async def check_sub_cb(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text("✅ Отлично! Доступ открыт.")
     await call.message.answer("🏠 <b>Главное меню</b>", reply_markup=main_menu_reply(call.from_user.id))
 
-# ---------- ПОИСК АНИМЕ (С КРАСИВОЙ ОБЛОЖКОЙ) ----------
+# ---------- ПОИСК АНИМЕ (С МУЛЬТИ-КАДРАМИ И ОБЛОЖКАМИ) ----------
 async def get_ru_title(anime_data):
     title = None
     year = None
@@ -264,21 +264,16 @@ async def get_ru_title(anime_data):
         pass
     return title
 
-async def search_tracemoe_api(image_bytes, is_url=False):
+async def search_tracemoe_api(image_bytes):
     async with aiohttp.ClientSession() as session:
         url = "https://api.trace.moe/search"
         headers = {}
         if TRACEMOE_TOKEN: headers["x-trace-token"] = TRACEMOE_TOKEN
         try:
-            if is_url:
-                async with session.get(url, params={"url": image_bytes}, headers=headers, timeout=15) as resp:
-                    return await resp.json()
-            else:
-                form = aiohttp.FormData()
-                form.add_field('file', image_bytes, filename='image.jpg')
-                async with session.post(url, data=form, headers=headers, timeout=15) as resp:
-                    return await resp.json()
-        except asyncio.TimeoutError: return {"error": "timeout"}
+            form = aiohttp.FormData()
+            form.add_field('file', image_bytes, filename='image.jpg')
+            async with session.post(url, data=form, headers=headers, timeout=15) as resp:
+                return await resp.json()
         except Exception as e: return {"error": str(e)}
 
 @router.message(F.text == "🖼 Поиск аниме")
@@ -314,51 +309,73 @@ async def handle_anime_search(message: Message, state: FSMContext):
         input_path = os.path.join(tmp_dir, "input_file")
         await bot.download_file(file.file_path, input_path)
 
-        # Если это видео — вырезаем кадр
+        frames_to_search = []
+        
         if is_video:
-            await msg.edit_text("🎬 <b>Извлекаю кадр из видео...</b>")
-            frame_path = os.path.join(tmp_dir, "frame.jpg")
-            # Берем кадр на 1 секунде
-            os.system(f"ffmpeg -i {input_path} -ss 00:00:01.000 -vframes 1 -q:v 2 {frame_path} -y -loglevel quiet")
-            # Если видео короче 1 секунды, берем самый первый кадр
-            if not os.path.exists(frame_path) or os.path.getsize(frame_path) == 0:
-                os.system(f"ffmpeg -i {input_path} -vframes 1 {frame_path} -y -loglevel quiet")
+            await msg.edit_text("🎬 <b>Извлекаю кадры из видео...</b>")
+            timestamps = [1, 3, 5]
+            for ts in timestamps:
+                frame_path = os.path.join(tmp_dir, f"frame_{ts}.jpg")
+                os.system(f"ffmpeg -i {input_path} -ss 00:00:0{ts}.000 -vframes 1 -q:v 2 {frame_path} -y -loglevel quiet")
+                if os.path.exists(frame_path) and os.path.getsize(frame_path) > 0:
+                    with open(frame_path, "rb") as f:
+                        frames_to_search.append(f.read())
             
-            with open(frame_path, "rb") as f:
-                image_to_search = f.read()
+            if not frames_to_search:
+                frame_path = os.path.join(tmp_dir, "frame_first.jpg")
+                os.system(f"ffmpeg -i {input_path} -vframes 1 {frame_path} -y -loglevel quiet")
+                if os.path.exists(frame_path):
+                    with open(frame_path, "rb") as f:
+                        frames_to_search.append(f.read())
         else:
             with open(input_path, "rb") as f:
-                image_to_search = f.read()
+                frames_to_search.append(f.read())
 
-        result = await search_tracemoe_api(image_to_search)
+        if not frames_to_search:
+            return await msg.edit_text("❌ Не удалось извлечь кадры из файла.")
 
-        if result.get("error"): return await msg.edit_text(f"❌ Ошибка: {result['error']}")
-        if not result.get("result"):
+        best_result = None
+        best_similarity = 0
+
+        for img_data in frames_to_search:
+            result = await search_tracemoe_api(img_data)
+            if result.get("result"):
+                for res in result["result"]:
+                    sim = res.get("similarity", 0)
+                    if sim > best_similarity:
+                        best_similarity = sim
+                        best_result = res
+
+        if not best_result:
             return await msg.edit_text("😔 <b>Ничего не найдено.</b>\n\nВозможно, это фанарт, AI-арт или кадр сильно обрезан.")
 
-        best = result["result"][0]
-        original_filename = best.get('filename', 'Неизвестно')
+        original_filename = best_result.get('filename', 'Неизвестно')
+        similarity = best_similarity * 100
         
         await msg.edit_text("🌐 <b>Перевожу название...</b>")
-        ru_title = await get_ru_title(best)
+        ru_title = await get_ru_title(best_result)
+
+        warning = ""
+        if similarity < 85:
+            warning = "\n\n⚠️ <b>Внимание:</b> Схожесть низкая. Бот может ошибаться."
 
         text = (
             f"🎬 <b>Аниме:</b> {ru_title}\n"
             f"📁 <b>Оригинал:</b> <code>{original_filename}</code>\n"
-            f"📺 <b>Серия:</b> {best.get('episode', '?')}\n"
-            f"⏱ <b>Таймкод:</b> {int(best.get('from', 0))} сек.\n"
-            f"📊 <b>Схожесть:</b> {best.get('similarity', 0) * 100:.1f}%"
+            f"📺 <b>Серия:</b> {best_result.get('episode', '?')}\n"
+            f"⏱ <b>Таймкод:</b> {int(best_result.get('from', 0))} сек.\n"
+            f"📊 <b>Схожесть:</b> {similarity:.1f}%"
+            f"{warning}"
         )
         
-        # Отправляем красивую обложку (постер) вместо уродливого видео
         cover_url = None
-        if best.get("anilist") and isinstance(best["anilist"], dict):
-            cover_url = best["anilist"].get("coverImage", {}).get("large")
+        if best_result.get("anilist") and isinstance(best_result["anilist"], dict):
+            cover_url = best_result["anilist"].get("coverImage", {}).get("large")
 
         if cover_url:
             await message.answer_photo(cover_url, caption=text)
-        elif best.get("image"):
-            await message.answer_photo(best["image"], caption=text)
+        elif best_result.get("image"):
+            await message.answer_photo(best_result["image"], caption=text)
         else:
             await message.answer(text)
         
@@ -375,19 +392,24 @@ async def handle_anime_link(message: Message, state: FSMContext):
     url = message.text.strip()
     if re.search(r'\.(jpg|jpeg|png|gif|webp)(\?|$)', url, re.I):
         msg = await message.answer("🔍 <b>Ищу аниме по ссылке...</b>")
-        result = await search_tracemoe_api(url, is_url=True)
-        if result.get("error"): await msg.edit_text(f"❌ Ошибка: {result['error']}")
-        elif not result.get("result"): await msg.edit_text("😔 Ничего не найдено.")
-        else:
-            best = result["result"][0]
-            original_filename = best.get('filename', 'Неизвестно')
-            ru_title = await get_ru_title(best)
-            await msg.edit_text(
-                f"🎬 <b>Аниме:</b> {ru_title}\n"
-                f"📁 <b>Оригинал:</b> <code>{original_filename}</code>\n"
-                f"📺 <b>Серия:</b> {best.get('episode', '?')}\n"
-                f"⏱ <b>Таймкод:</b> {int(best.get('from', 0))} сек."
-            )
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    img_data = await resp.read()
+                    result = await search_tracemoe_api(img_data)
+                    if result.get("result"):
+                        best = result["result"][0]
+                        ru_title = await get_ru_title(best)
+                        await msg.edit_text(
+                            f"🎬 <b>Аниме:</b> {ru_title}\n"
+                            f"📁 <b>Оригинал:</b> <code>{best.get('filename', 'Неизвестно')}</code>\n"
+                            f"📺 <b>Серия:</b> {best.get('episode', '?')}\n"
+                            f"⏱ <b>Таймкод:</b> {int(best.get('from', 0))} сек."
+                        )
+                    else:
+                        await msg.edit_text("😔 Ничего не найдено.")
+                else:
+                    await msg.edit_text("❌ Не удалось загрузить изображение по ссылке.")
 
 # ---------- ПОИСК МУЗЫКИ ----------
 @router.message(F.text == "🎵 Поиск музыки")
