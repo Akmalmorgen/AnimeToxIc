@@ -8,8 +8,6 @@ import shutil
 import sys
 import tempfile
 import time
-import urllib.request
-import urllib.parse
 from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
@@ -42,7 +40,6 @@ SAUCENAO_KEY = os.getenv("SAUCENAO_KEY", "").strip()
 SPAM_DELAY = 3
 TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024
 TG_UPLOAD_LIMIT = 49 * 1024 * 1024
-SC_CANDIDATES = 5
 FFMPEG_OK = shutil.which("ffmpeg") is not None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -336,7 +333,7 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
         f"✨ Привет, <b>{esc(message.from_user.first_name or 'друг')}</b>!\n\n"
-        "🖼 <b>Поиск аниме</b> — скинь скриншот или видео\n"
+        "🖼 <b>Поиск аниме</b> — скинь скриншот, видео или ссылку (YouTube/TikTok/картинка)\n"
         "🎵 <b>Поиск музыки</b> — название, голосовое, аудио, видео или ссылка на клип.\n"
         "Распознаю песню и даю скачать полный трек прямо в чат.\n\n"
         "👇 Выбирай кнопку внизу:",
@@ -347,8 +344,11 @@ async def anime_menu(message: Message, state: FSMContext):
     await state.clear()
     await state.set_state(UserStates.waiting_anime)
     await message.answer(
-        "🖼 <b>Поиск аниме по кадру</b>\n\n"
-        "Отправь <b>скриншот</b>, <b>видео</b> (до 20 МБ) или ссылку на картинку.\n"
+        "🖼 <b>Поиск аниме</b>\n\n"
+        "Отправь:\n"
+        "📸 <b>Скриншот / картинку</b>\n"
+        "🎬 <b>Видео</b> (до 20 МБ)\n"
+        "🔗 <b>Ссылку</b> — YouTube, TikTok, Instagram или прямую ссылку на картинку\n\n"
         "Если это фанарт — попробую найти источник арта.",
         reply_markup=back_kb())
 
@@ -360,7 +360,7 @@ async def music_menu(message: Message, state: FSMContext):
         "🎵 <b>Поиск музыки</b>\n\n"
         "📝 Название песни текстом\n"
         "🎤 Голосовое / аудио / видео\n"
-        "🔗 Ссылка на клип (TikTok, Shorts, Instagram…)\n\n"
+        "🔗 Ссылка на клип (YouTube, TikTok, Shorts, Instagram…)\n\n"
         "Распознаю песню и отправляю <b>полный трек файлом</b>.",
         reply_markup=cancel_kb())
 
@@ -394,101 +394,46 @@ async def cb_check_sub(call: CallbackQuery, state: FSMContext):
 
 # ---------- МУЗЫКА ----------
 
-def _deezer_search(query: str) -> list[dict]:
-    """Поиск через Deezer API — есть ВСЯ музыка мира (узбекская, русская, любая)."""
-    results = []
+async def shazam_recognize(path: Path) -> tuple[str, str] | None:
+    """Распознаёт трек через Shazam. Возвращает (artist, title) или None."""
     try:
-        url = f"https://api.deezer.com/search?q={urllib.parse.quote(query)}&limit=10"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-        for track in data.get("data", []):
-            artist = track.get("artist", {}).get("name", "")
-            title = track.get("title", "")
-            duration = track.get("duration", 0)
-            if duration < 30:
-                continue
-            results.append({
-                "title": title,
-                "uploader": artist,
-                "duration": duration,
-                "yt_query": f"{artist} - {title}",
-                "source": "deezer",
-            })
+        async with Shazam() as sh:
+            out = await sh.recognize(str(path))
     except Exception as e:
-        log.warning("deezer search: %s", e)
-    return results
+        log.warning("shazam recognize: %s", e)
+        return None
+    track = getattr(out, "track", None)
+    if track is None and isinstance(out, dict):
+        track = out.get("track")
+    if not track:
+        return None
+    get = (lambda k: track.get(k)) if isinstance(track, dict) else (lambda k: getattr(track, k, None))
+    title, subtitle = get("title"), get("subtitle")
+    if not title:
+        return None
+    return (subtitle or "").strip(), title.strip()
 
-def _yt_search_for_query(yt_query: str) -> str | None:
-    """Ищет видео на YouTube по запросу и возвращает URL."""
+def _yt_search_url(query: str) -> str | None:
+    """Ищет видео на YouTube и возвращает URL первого результата."""
     try:
         opts = {
             "quiet": True, "no_warnings": True, "noplaylist": True,
             "skip_download": True, "extract_flat": True, "socket_timeout": 30,
         }
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(f"ytsearch1:{yt_query}", download=False)
+            info = ydl.extract_info(f"ytsearch5:{query}", download=False)
         if info and info.get("entries"):
-            video = info["entries"][0]
-            return video.get("webpage_url")
+            for e in info["entries"]:
+                dur = e.get("duration") or 0
+                if dur and dur < 30:
+                    continue
+                return e.get("webpage_url")
     except Exception as e:
         log.warning("yt search: %s", e)
     return None
 
-def _sc_search(query: str, title_hint: str | None = None) -> list[dict]:
-    """Поиск: Deezer (вся музыка) → YouTube для скачивания."""
-    queries = [query]
-    if title_hint:
-        th = title_hint.strip()
-        if th and norm(th) != norm(query):
-            queries.append(th)
-
-    seen_queries = set()
-    candidates = []
-
-    # 1. Ищем через Deezer (есть узбекская музыка и всё остальное)
-    for q in queries:
-        for track in _deezer_search(q):
-            if track["yt_query"] not in seen_queries:
-                seen_queries.add(track["yt_query"])
-                candidates.append(track)
-
-    # 2. Для каждого результата ищем URL на YouTube
-    final = []
-    for c in candidates:
-        url = _yt_search_for_query(c["yt_query"])
-        if url:
-            final.append({
-                "url": url,
-                "title": c["title"],
-                "uploader": c["uploader"],
-                "duration": c["duration"],
-                "match": 1.0,
-                "source": c["source"],
-            })
-        if len(final) >= 3:
-            break
-
-    # 3. Если Deezer не дал результатов — ищем напрямую на YouTube
-    if not final:
-        for q in queries:
-            url = _yt_search_for_query(q)
-            if url:
-                final.append({
-                    "url": url,
-                    "title": q,
-                    "uploader": "Неизвестно",
-                    "duration": 0,
-                    "match": 0.5,
-                    "source": "youtube",
-                })
-            if len(final) >= 3:
-                break
-
-    return final
-
-def _sc_download(url: str, tmp: str) -> tuple[Path, dict]:
-    """Скачивает трек с YouTube."""
+def _download_audio(url: str, tmp: str) -> tuple[Path, dict]:
+    """Скачивает аудио с YouTube/SoundCloud/etc."""
     opts = {
         "quiet": True, "no_warnings": True, "noplaylist": True,
         "socket_timeout": 60, "retries": 3,
@@ -506,10 +451,14 @@ def _sc_download(url: str, tmp: str) -> tuple[Path, dict]:
         raise RuntimeError("файл не скачался")
     return files[0], info or {}
 
-def _clip_download(url: str, tmp: str) -> Path:
-    opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "socket_timeout": 30,
-            "retries": 2, "max_filesize": 30 * 1024 * 1024,
-            "format": "bestaudio/best", "outtmpl": os.path.join(tmp, "clip.%(ext)s")}
+def _download_clip(url: str, tmp: str) -> Path:
+    """Скачивает клип для распознавания."""
+    opts = {
+        "quiet": True, "no_warnings": True, "noplaylist": True,
+        "socket_timeout": 60, "retries": 2, "max_filesize": 50 * 1024 * 1024,
+        "format": "bestaudio/best",
+        "outtmpl": os.path.join(tmp, "clip.%(ext)s"),
+    }
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.extract_info(url, download=True)
     files = sorted(Path(tmp).glob("clip.*"))
@@ -517,57 +466,72 @@ def _clip_download(url: str, tmp: str) -> Path:
         raise RuntimeError("не удалось скачать клип")
     return files[0]
 
-async def shazam_recognize(path: Path) -> tuple[str, str] | None:
-    """Распознаёт трек через Shazam. Возвращает (artist, title) или None."""
-    try:
-        async with Shazam() as sh:
-            out = await sh.recognize(str(path))
-    except Exception as e:
-        log.warning("recognize: %s", e)
-        return None
-    track = getattr(out, "track", None)
-    if track is None and isinstance(out, dict):
-        track = out.get("track")
-    if not track:
-        return None
-    get = (lambda k: track.get(k)) if isinstance(track, dict) else (lambda k: getattr(track, k, None))
-    title, subtitle = get("title"), get("subtitle")
-    if not title:
-        return None
-    return (subtitle or "").strip(), title.strip()
+async def find_and_deliver_track(message: Message, state: FSMContext,
+                                  query: str, label: str | None, progress: Message) -> bool:
+    """Находит трек по запросу и отправляет файлом."""
+    # 1. Проверяем кэш
+    key = norm(query)
+    cached = await get_cached_track(key)
+    if cached:
+        caption = (f"🎵 <b>{esc(cached['title'] or 'Трек')}</b>\n"
+                   f"👤 {FANCY_BRAND}\n"
+                   f"⏱ {fmt_dur(0)}\n\n"
+                   f"📥 @{BOT_USERNAME}")
+        if label:
+            caption = f"🎧 <b>Распознано:</b> {esc(label)}\n\n" + caption
+        await message.answer_audio(
+            audio=cached["file_id"],
+            title=(cached["title"] or "")[:64],
+            performer=FANCY_BRAND,
+            caption=caption,
+            reply_markup=back_kb())
+        await safe_delete(progress)
+        return True
 
-async def deliver_track(message: Message, state: FSMContext, cand: dict,
-                        key: str, label: str | None, progress: Message) -> bool:
-    """Скачивает трек и отправляет ФАЙЛОМ (не ссылкой!)."""
+    # 2. Ищем на YouTube
+    await safe_edit(progress, "🔎 <b>Ищу на YouTube...</b>")
+    url = _yt_search_url(query)
+    if not url:
+        return False
+
+    # 3. Скачиваем
     tmp = tempfile.mkdtemp()
     try:
         await safe_edit(progress, "⬇️ <b>Скачиваю трек...</b>")
-        path, info = await asyncio.to_thread(_sc_download, cand["url"], tmp)
+        path, info = await asyncio.to_thread(_download_audio, url, tmp)
         if path.stat().st_size > TG_UPLOAD_LIMIT:
             return False
+        # Конвертируем в mp3 если нужно
         if path.suffix.lower() not in (".mp3", ".m4a"):
             if not FFMPEG_OK:
                 return False
             mp3 = path.with_suffix(".mp3")
             await run_ffmpeg("-i", str(path), "-vn", "-c:a", "libmp3lame", "-b:a", "192k", str(mp3))
             path = mp3
-        title = info.get("title") or cand["title"]
-        duration = int(info.get("duration") or cand["duration"] or 0)
-        caption = (f"🎵 <b>{esc(title)}</b>\n👤 {FANCY_BRAND}\n⏱ {fmt_dur(duration)}\n\n"
+
+        title = info.get("title") or query
+        duration = int(info.get("duration") or 0)
+
+        caption = (f"🎵 <b>{esc(title)}</b>\n"
+                   f"👤 {FANCY_BRAND}\n"
+                   f"⏱ {fmt_dur(duration)}\n\n"
                    f"📥 @{BOT_USERNAME}")
         if label:
             caption = f"🎧 <b>Распознано:</b> {esc(label)}\n\n" + caption
-        rows = []
-        data = await state.get_data()
-        if len(data.get("sc_candidates") or []) > 1:
-            rows.append([btn("🔁 Другая версия", callback_data="sc_alt", style="primary")])
-        rows.append([btn("◀️ В меню", callback_data="main_menu", style="danger")])
+
+        rows = [[btn("◀️ В меню", callback_data="main_menu", style="danger")]]
         sent = await message.answer_audio(
-            audio=FSInputFile(str(path)), title=title[:64], performer=FANCY_BRAND,
-            duration=duration, caption=caption,
+            audio=FSInputFile(str(path)),
+            title=title[:64],
+            performer=FANCY_BRAND,
+            duration=duration,
+            caption=caption,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+        # Сохраняем в кэш
         if sent.audio:
             await cache_track(key, sent.audio.file_id, title, FANCY_BRAND)
+
         await safe_delete(progress)
         return True
     except Exception as e:
@@ -578,57 +542,24 @@ async def deliver_track(message: Message, state: FSMContext, cand: dict,
 
 async def process_music(message: Message, state: FSMContext, query: str,
                         label: str | None = None, progress: Message | None = None):
-    """Основная логика поиска музыки. ВСЕГДА скачивает файл."""
+    """Главная функция поиска музыки."""
     progress = progress or await message.answer("🔎 <b>Ищу трек...</b>")
-    key = norm(query)
-    cached = await get_cached_track(key)
-    if cached:
-        caption = (f"🎵 <b>{esc(cached['title'] or 'Трек')}</b>\n👤 {FANCY_BRAND}\n⏱ {fmt_dur(0)}\n\n"
-                   f"📥 @{BOT_USERNAME}")
-        if label:
-            caption = f"🎧 <b>Распознано:</b> {esc(label)}\n\n" + caption
-        await message.answer_audio(audio=cached["file_id"], title=(cached["title"] or "")[:64],
-                                   performer=FANCY_BRAND, caption=caption,
-                                   reply_markup=back_kb())
-        await safe_delete(progress)
-        return
-    await safe_edit(progress, "🔎 <b>Ищу трек...</b>")
-    title_hint = label.split(" – ", 1)[1].strip() if label and " – " in label else None
-    try:
-        candidates = await asyncio.to_thread(_sc_search, query, title_hint)
-    except Exception as e:
-        log.warning("search: %s", e)
-        candidates = []
-    if not candidates:
+
+    # Если есть label от Shazam — используем его как запрос
+    search_query = label if label else query
+
+    ok = await find_and_deliver_track(message, state, search_query, label, progress)
+    if not ok:
+        # Пробуем второй раз с оригинальным запросом
+        if label and label != query:
+            ok = await find_and_deliver_track(message, state, query, label, progress)
+
+    if not ok:
         text = (f"🎧 <b>Распознано:</b> {esc(label)}\n\n" if label else "")
         text += "😔 Не нашёл именно этот трек. Попробуй ввести название вручную."
         await safe_edit(progress, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [btn("✏️ Ввести название", callback_data="sc_manual", style="primary")],
             [btn("◀️ В меню", callback_data="main_menu", style="danger")]]))
-        return
-    await state.update_data(sc_candidates=candidates, sc_index=0, sc_key=key, sc_label=label)
-    for i, cand in enumerate(candidates[:3]):
-        await state.update_data(sc_index=i)
-        if await deliver_track(message, state, cand, key, label, progress):
-            return
-    await safe_edit(progress, "😔 Не удалось скачать ни одну версию. Попробуй другое название.",
-                    reply_markup=back_kb())
-
-@user.callback_query(F.data == "sc_alt")
-async def cb_alt_version(call: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    cands = data.get("sc_candidates") or []
-    idx = int(data.get("sc_index", 0)) + 1
-    if not cands or idx >= len(cands):
-        return await call.answer("Больше версий нет 🤷", show_alert=True)
-    await call.answer("Ищу другую версию...")
-    await state.update_data(sc_index=idx)
-    progress = await call.message.answer("⬇️ <b>Скачиваю другую версию...</b>")
-    ok = await deliver_track(call.message, state, cands[idx], data.get("sc_key", ""),
-                             data.get("sc_label"), progress)
-    if not ok:
-        await safe_edit(progress, "😔 Эта версия не скачалась. Попробуй ещё раз или введи название.",
-                        reply_markup=back_kb())
 
 @user.callback_query(F.data == "sc_manual")
 async def cb_manual(call: CallbackQuery, state: FSMContext):
@@ -646,11 +577,11 @@ async def music_text(message: Message, state: FSMContext):
         progress = await message.answer("🔗 <b>Скачиваю клип и слушаю...</b>")
         tmp = tempfile.mkdtemp()
         try:
-            clip = await asyncio.to_thread(_clip_download, text, tmp)
+            clip = await asyncio.to_thread(_download_clip, text, tmp)
             audio = Path(tmp) / "audio.mp3"
             await run_ffmpeg("-i", str(clip), "-vn", "-ac", "1", "-ar", "16000",
                              "-c:a", "libmp3lame", "-b:a", "128k", str(audio))
-            await safe_edit(progress, "🎧 <b>Распознаю...</b>")
+            await safe_edit(progress, "🎧 <b>Распознаю через Shazam...</b>")
             res = await shazam_recognize(audio)
             if not res:
                 return await safe_edit(progress, "😔 Не удалось распознать песню из клипа.",
@@ -679,7 +610,7 @@ async def music_media(message: Message, state: FSMContext):
     is_video_input = bool(message.video or message.video_note or doc_mime.startswith("video/"))
     if is_video_input and not FFMPEG_OK:
         return await message.answer(NO_FFMPEG_TEXT, reply_markup=back_kb())
-    progress = await message.answer("🎧 <b>Слушаю...</b>")
+    progress = await message.answer("🎧 <b>Слушаю и распознаю через Shazam...</b>")
     tmp = tempfile.mkdtemp()
     try:
         if message.voice: fid, ext = message.voice.file_id, ".ogg"
@@ -697,7 +628,7 @@ async def music_media(message: Message, state: FSMContext):
             process_path = Path(tmp) / "audio.mp3"
             await run_ffmpeg("-i", str(src), "-vn", "-ac", "1", "-ar", "16000",
                              "-c:a", "libmp3lame", "-b:a", "128k", str(process_path))
-        await safe_edit(progress, "🎧 <b>Распознаю...</b>")
+        await safe_edit(progress, "🎧 <b>Распознаю через Shazam...</b>")
         res = await shazam_recognize(process_path)
         if not res:
             return await safe_edit(progress, "😔 Не удалось распознать песню. "
@@ -848,6 +779,69 @@ async def do_anime_search(message: Message, frames: list[bytes], fid: str | None
                                       "кадр сильно обрезан или серия ещё не в базе. Попробуй другой кадр.",
                             reply_markup=back_kb())
 
+async def extract_frames_from_url(url: str, tmp: str) -> list[bytes]:
+    """Скачивает видео/картинку по ссылке и извлекает кадры."""
+    # Проверяем, картинка ли это
+    if re.search(r"\.(jpe?g|png|webp|gif)(\?|$)", url, re.I):
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status == 200:
+                    return [await resp.read()]
+        return []
+
+    # Это видео — скачиваем через yt-dlp
+    opts = {
+        "quiet": True, "no_warnings": True, "noplaylist": True,
+        "socket_timeout": 60, "retries": 2,
+        "max_filesize": 50 * 1024 * 1024,
+        "format": "best[height<=720]/best",
+        "outtmpl": os.path.join(tmp, "video.%(ext)s"),
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.extract_info(url, download=True)
+    except Exception as e:
+        log.warning("download video from url: %s", e)
+        return []
+
+    files = sorted(Path(tmp).glob("video.*"))
+    if not files:
+        return []
+
+    src = str(files[0])
+    frames = []
+    for ts in (1, 3, 5, 7, 9):
+        out = os.path.join(tmp, f"f{ts}.jpg")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-ss", str(ts), "-i", src, "-frames:v", "1", "-q:v", "2", out,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=30)
+        except Exception:
+            continue
+        if os.path.exists(out) and os.path.getsize(out) > 0:
+            frames.append(Path(out).read_bytes())
+        if len(frames) >= 3:
+            break
+
+    if not frames:
+        out = os.path.join(tmp, "f0.jpg")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-i", src, "-frames:v", "1", "-q:v", "2", out,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=30)
+            if os.path.exists(out) and os.path.getsize(out) > 0:
+                frames.append(Path(out).read_bytes())
+        except Exception:
+            pass
+
+    return frames
+
 @user.message(UserStates.waiting_anime, F.photo | F.video | F.document)
 async def anime_media(message: Message, state: FSMContext):
     if tg_file_size(message) > TG_DOWNLOAD_LIMIT:
@@ -905,31 +899,25 @@ async def anime_media(message: Message, state: FSMContext):
 
 @user.message(UserStates.waiting_anime, F.text)
 async def anime_link(message: Message, state: FSMContext):
+    """Обработка ссылки — поддерживает и картинки, и видео (YouTube, TikTok и т.д.)."""
     url = (message.text or "").strip()
     if not url.startswith(("http://", "https://")):
-        return await message.answer("Пришли скриншот, видео или ссылку на картинку 🙂", reply_markup=cancel_kb())
-    if not re.search(r"\.(jpe?g|png|webp|gif)(\?|$)", url, re.I):
-        return await message.answer("По ссылке должна быть картинка. Для клипов используй «🎵 Поиск музыки».",
-                                    reply_markup=cancel_kb())
-    progress = await message.answer("🔍 <b>Ищу по ссылке...</b>")
-    async with aiohttp.ClientSession() as session:
-        res = await trace_search(session, url=url)
-        if res.get("error") == "quota":
-            return await safe_edit(progress, "⚠️ Дневной лимит поиска исчерпан. Попробуй завтра.",
+        return await message.answer("Пришли скриншот, видео или ссылку 🙂", reply_markup=cancel_kb())
+
+    progress = await message.answer("🔍 <b>Загружаю по ссылке...</b>")
+    tmp = tempfile.mkdtemp()
+    try:
+        frames = await extract_frames_from_url(url, tmp)
+        if not frames:
+            return await safe_edit(progress, "❌ Не удалось загрузить файл по ссылке. "
+                                             "Проверь ссылку или пришли файл напрямую.",
                                    reply_markup=back_kb())
-        results = res.get("result") or []
-        if not results:
-            return await safe_edit(progress, "😔 Ничего не найдено по ссылке.", reply_markup=back_kb())
-        best = results[0]
-        ani = best.get("anilist") if isinstance(best.get("anilist"), dict) else {}
-        titles = ani.get("title") or {}
-        orig = titles.get("english") or titles.get("romaji") or best.get("filename", "?")
-        ru = await ru_title(session, orig, ani.get("seasonYear"))
-    sim = best.get("similarity", 0) * 100
-    await safe_edit(progress, f"🎬 <b>Аниме:</b> {esc(ru)}\n🇯🇵 {esc(orig)}\n"
-                              f"📺 Серия: {esc(str(best.get('episode', '?')))}\n"
-                              f"⏱ Таймкод: {int(best.get('from', 0))} сек.\n📊 Схожесть: {sim:.1f}%",
-                    reply_markup=back_kb())
+        await do_anime_search(message, frames, None, progress)
+    except Exception as e:
+        log.warning("anime_link: %s", e)
+        await safe_edit(progress, f"❌ Ошибка: {esc(str(e))[:200]}", reply_markup=back_kb())
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 # ---------- АДМИНКА ----------
 async def render_admin_panel(msg: Message, edit: bool):
@@ -962,48 +950,30 @@ async def cmd_clearcache(message: Message, state: FSMContext):
             animes = await conn.fetchval("SELECT COUNT(*) FROM anime_cache")
             await conn.execute("TRUNCATE TABLE track_cache, anime_cache;")
         await message.answer(
-            f"✅ <b>Кэш успешно очищен!</b>\n\n"
-            f"🗑 Удалено треков: <b>{tracks}</b>\n"
-            f"🗑 Удалено аниме: <b>{animes}</b>\n\n"
-            f"Теперь все новые запросы будут сохраняться с обновлённой подписью.",
+            f"✅ <b>Кэш очищен!</b>\n\n🗑 Треков: <b>{tracks}</b>\n🗑 Аниме: <b>{animes}</b>",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [btn("◀️ В админку", callback_data="admin_back", style="danger")]
             ])
         )
     except Exception as e:
-        log.error("Ошибка очистки кэша: %s", e)
-        await message.answer(
-            f"❌ Ошибка при очистке кэша: {esc(str(e))[:200]}",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [btn("◀️ В админку", callback_data="admin_back", style="danger")]
-            ])
-        )
+        await message.answer(f"❌ Ошибка: {esc(str(e))[:200]}")
 
 @admin.callback_query(F.data == "clear_cache")
 async def cb_clear_cache(call: CallbackQuery, state: FSMContext):
-    await call.answer("Очищаю кэш...")
+    await call.answer("Очищаю...")
     try:
         async with db_pool.acquire() as conn:
             tracks = await conn.fetchval("SELECT COUNT(*) FROM track_cache")
             animes = await conn.fetchval("SELECT COUNT(*) FROM anime_cache")
             await conn.execute("TRUNCATE TABLE track_cache, anime_cache;")
         await call.message.edit_text(
-            f"✅ <b>Кэш успешно очищен!</b>\n\n"
-            f"🗑 Удалено треков: <b>{tracks}</b>\n"
-            f"🗑 Удалено аниме: <b>{animes}</b>\n\n"
-            f"Теперь все новые запросы будут сохраняться с обновлённой подписью.",
+            f"✅ <b>Кэш очищен!</b>\n🗑 Треков: {tracks}\n🗑 Аниме: {animes}",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [btn("◀️ В админку", callback_data="admin_back", style="danger")]
             ])
         )
     except Exception as e:
-        log.error("Ошибка очистки кэша: %s", e)
-        await call.message.edit_text(
-            f"❌ Ошибка при очистке кэша: {esc(str(e))[:200]}",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [btn("◀️ В админку", callback_data="admin_back", style="danger")]
-            ])
-        )
+        await call.message.edit_text(f"❌ Ошибка: {esc(str(e))[:200]}")
 
 @admin.callback_query(F.data == "admin_back")
 async def admin_back(call: CallbackQuery, state: FSMContext):
@@ -1020,24 +990,21 @@ async def sub_menu(call: CallbackQuery, state: FSMContext):
         [btn("✏️ Настроить", callback_data="sub_setup", style="primary")],
         [btn("🗑 Удалить", callback_data="sub_delete", style="danger")],
         [btn("◀️ Назад", callback_data="admin_back", style="danger")]])
-    await call.message.edit_text(f"🔒 <b>Обязательная подписка</b>\n\nСтатус: {status}\n\n"
-                                 "Бот должен быть <b>админом</b> канала.", reply_markup=kb)
+    await call.message.edit_text(f"🔒 <b>Обязательная подписка</b>\n\nСтатус: {status}", reply_markup=kb)
     await call.answer()
 
 @admin.callback_query(F.data == "sub_setup")
 async def sub_setup(call: CallbackQuery, state: FSMContext):
     await state.clear()
     await state.set_state(AdminStates.sub_name)
-    await call.message.edit_text("📝 <b>Шаг 1/4:</b> название кнопки (например «📢 Подписаться»):",
-                                 reply_markup=admin_cancel_kb())
+    await call.message.edit_text("📝 <b>Шаг 1/4:</b> название кнопки:", reply_markup=admin_cancel_kb())
     await call.answer()
 
 @admin.message(AdminStates.sub_name, F.text)
 async def sub_name(message: Message, state: FSMContext):
     await state.update_data(sub_button_text=message.text.strip()[:64])
     await state.set_state(AdminStates.sub_channel)
-    await message.answer("📝 <b>Шаг 2/4:</b> канал для проверки: @username, публичная ссылка или ID (-100…).\n"
-                         "Инвайт-ссылку пришлёшь на следующем шаге.", reply_markup=admin_cancel_kb())
+    await message.answer("📝 <b>Шаг 2/4:</b> канал (@username или ID -100...):", reply_markup=admin_cancel_kb())
 
 def parse_channel(text: str) -> str | None:
     t = text.strip()
@@ -1054,23 +1021,19 @@ def parse_channel(text: str) -> str | None:
 async def sub_channel(message: Message, state: FSMContext):
     ch = parse_channel(message.text)
     if not ch:
-        return await message.answer("⚠️ По инвайт-ссылке проверить нельзя. Пришли @username или ID (-100…).",
-                                    reply_markup=admin_cancel_kb())
+        return await message.answer("⚠️ Неверный формат. Пришли @username или ID.", reply_markup=admin_cancel_kb())
     try:
         me = await bot.get_chat_member(ch, bot.id)
         if me.status not in ("administrator", "creator"):
-            return await message.answer("⚠️ Бот не админ этого канала. Добавь админом и пришли канал ещё раз.",
-                                        reply_markup=admin_cancel_kb())
+            return await message.answer("⚠️ Бот не админ канала.", reply_markup=admin_cancel_kb())
     except Exception as e:
-        return await message.answer(f"⚠️ Не вижу канал: {esc(str(e))[:150]}\nПроверь и пришли ещё раз.",
-                                    reply_markup=admin_cancel_kb())
+        return await message.answer(f"⚠️ Не вижу канал: {esc(str(e))[:100]}", reply_markup=admin_cancel_kb())
     await state.update_data(sub_channel_id=ch)
     await state.set_state(AdminStates.sub_btn_url)
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [btn("⏭ Авто из username", callback_data="sub_url_skip", style="success")],
+        [btn("⏭ Авто", callback_data="sub_url_skip", style="success")],
         [btn("❌ Отмена", callback_data="admin_back", style="danger")]])
-    await message.answer("📝 <b>Шаг 3/4:</b> ссылка для кнопки (инвайт или публичная), либо «Авто».",
-                         reply_markup=kb)
+    await message.answer("📝 <b>Шаг 3/4:</b> ссылка для кнопки или «Авто»:", reply_markup=kb)
 
 @admin.callback_query(F.data == "sub_url_skip")
 async def sub_url_skip(call: CallbackQuery, state: FSMContext):
@@ -1079,7 +1042,7 @@ async def sub_url_skip(call: CallbackQuery, state: FSMContext):
     url = f"https://t.me/{ch.lstrip('@')}" if ch.startswith("@") else None
     await state.update_data(sub_button_url=url)
     await state.set_state(AdminStates.sub_photo)
-    await call.message.edit_text("📝 <b>Шаг 4/4:</b> фото для сообщения подписки или «Пропустить».",
+    await call.message.edit_text("📝 <b>Шаг 4/4:</b> фото или «Пропустить»:",
                                  reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                                      [btn("⏭ Пропустить", callback_data="sub_photo_skip", style="success")],
                                      [btn("❌ Отмена", callback_data="admin_back", style="danger")]]))
@@ -1089,7 +1052,7 @@ async def sub_url_skip(call: CallbackQuery, state: FSMContext):
 async def sub_btn_url(message: Message, state: FSMContext):
     url = message.text.strip()
     if not url.startswith(("http://", "https://")):
-        return await message.answer("Пришли ссылку http(s)://…", reply_markup=admin_cancel_kb())
+        return await message.answer("Нужна ссылка http(s)://…", reply_markup=admin_cancel_kb())
     await state.update_data(sub_button_url=url)
     await state.set_state(AdminStates.sub_photo)
     await message.answer("📝 <b>Шаг 4/4:</b> фото или «Пропустить».",
@@ -1107,11 +1070,10 @@ async def finish_sub_setup(message: Message, state: FSMContext, photo_id: str | 
     await state.clear()
     await state.set_state(AdminStates.main)
     kb = InlineKeyboardMarkup(inline_keyboard=[[btn("◀️ В админку", callback_data="admin_back", style="danger")]])
-    text = "✅ <b>Подписка настроена!</b>"
     if edit:
-        await message.edit_text(text, reply_markup=kb)
+        await message.edit_text("✅ Подписка настроена!", reply_markup=kb)
     else:
-        await message.answer(text, reply_markup=kb)
+        await message.answer("✅ Подписка настроена!", reply_markup=kb)
 
 @admin.message(AdminStates.sub_photo, F.photo)
 async def sub_photo(message: Message, state: FSMContext):
@@ -1126,10 +1088,9 @@ async def sub_photo_skip(call: CallbackQuery, state: FSMContext):
 async def sub_delete(call: CallbackQuery, state: FSMContext):
     await set_setting("subscription", {})
     await call.answer("🗑 Удалено!", show_alert=True)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    await call.message.edit_text("🔒 Подписка: ❌ не настроена", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [btn("✏️ Настроить", callback_data="sub_setup", style="primary")],
-        [btn("◀️ Назад", callback_data="admin_back", style="danger")]])
-    await call.message.edit_text("🔒 <b>Подписка</b>\n\nСтатус: ❌ не настроена", reply_markup=kb)
+        [btn("◀️ Назад", callback_data="admin_back", style="danger")]]))
 
 # ---------- РАССЫЛКА ----------
 @admin.callback_query(F.data == "bc_menu")
@@ -1145,36 +1106,36 @@ async def bc_menu(call: CallbackQuery, state: FSMContext):
 async def bc_with(call: CallbackQuery, state: FSMContext):
     await state.clear()
     await state.set_state(AdminStates.bc_text)
-    await call.message.edit_text("✍️ Отправь <b>текст</b> рассылки:", reply_markup=admin_cancel_kb())
+    await call.message.edit_text("✍️ Отправь текст рассылки:", reply_markup=admin_cancel_kb())
     await call.answer()
 
 @admin.message(AdminStates.bc_text, F.text)
 async def bc_text(message: Message, state: FSMContext):
     await state.update_data(bc_text=message.text)
     await state.set_state(AdminStates.bc_photo)
-    await message.answer("🖼 Добавь <b>фото</b> или пропусти:",
+    await message.answer("🖼 Фото или пропусти:",
                          reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                             [btn("⏭ Пропустить фото", callback_data="bc_photo_skip", style="success")],
+                             [btn("⏭ Пропустить", callback_data="bc_photo_skip", style="success")],
                              [btn("❌ Отмена", callback_data="admin_back", style="danger")]]))
 
 @admin.message(AdminStates.bc_photo, F.photo)
 async def bc_photo(message: Message, state: FSMContext):
     await state.update_data(bc_photo=message.photo[-1].file_id)
     await state.set_state(AdminStates.bc_btn_text)
-    await message.answer("🔘 Теперь <b>текст кнопки</b>:", reply_markup=admin_cancel_kb())
+    await message.answer("🔘 Текст кнопки:", reply_markup=admin_cancel_kb())
 
 @admin.callback_query(F.data == "bc_photo_skip")
 async def bc_photo_skip(call: CallbackQuery, state: FSMContext):
     await state.update_data(bc_photo=None)
     await state.set_state(AdminStates.bc_btn_text)
-    await call.message.edit_text("🔘 Теперь <b>текст кнопки</b>:", reply_markup=admin_cancel_kb())
+    await call.message.edit_text("🔘 Текст кнопки:", reply_markup=admin_cancel_kb())
     await call.answer()
 
 @admin.message(AdminStates.bc_btn_text, F.text)
 async def bc_btn_text(message: Message, state: FSMContext):
     await state.update_data(bc_btn_text=message.text.strip()[:64])
     await state.set_state(AdminStates.bc_btn_url)
-    await message.answer("🔗 Теперь <b>ссылка кнопки</b> (http(s)://…):", reply_markup=admin_cancel_kb())
+    await message.answer("🔗 Ссылка кнопки (http(s)://…):", reply_markup=admin_cancel_kb())
 
 @admin.message(AdminStates.bc_btn_url, F.text)
 async def bc_btn_url(message: Message, state: FSMContext):
@@ -1194,28 +1155,27 @@ async def show_bc_preview(message: Message, state: FSMContext):
     if data.get("bc_btn_text") and data.get("bc_btn_url"):
         markup = InlineKeyboardMarkup(inline_keyboard=[
             [btn(data["bc_btn_text"], url=data["bc_btn_url"], style="primary")]])
-    await message.answer("👀 <b>Предпросмотр:</b>")
+    await message.answer("👀 Предпросмотр:")
     if data.get("bc_photo"):
         await message.answer_photo(data["bc_photo"], caption=data.get("bc_text", ""), reply_markup=markup)
     else:
         await message.answer(data.get("bc_text", ""), reply_markup=markup)
-    await message.answer("Подтверди отправку:", reply_markup=kb)
+    await message.answer("Подтверди:", reply_markup=kb)
 
 @admin.callback_query(F.data == "bc_without")
 async def bc_without(call: CallbackQuery, state: FSMContext):
     await state.clear()
     await state.set_state(AdminStates.bc_copy)
-    await call.message.edit_text("✍️ Отправь <b>что угодно</b> (текст, фото, видео, стикер) — скопирую всем:",
-                                 reply_markup=admin_cancel_kb())
+    await call.message.edit_text("✍️ Отправь что угодно — скопирую всем:", reply_markup=admin_cancel_kb())
     await call.answer()
 
 @admin.message(AdminStates.bc_copy)
 async def bc_copy(message: Message, state: FSMContext):
     await state.update_data(copy_message_id=message.message_id, copy_from_chat=message.chat.id)
     await state.set_state(AdminStates.bc_preview)
-    await message.answer("👀 <b>Предпросмотр:</b>")
+    await message.answer("👀 Предпросмотр:")
     await message.copy_to(chat_id=message.chat.id)
-    await message.answer("Подтверди отправку:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+    await message.answer("Подтверди:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [btn("🚀 Отправить", callback_data="bc_confirm", style="success")],
         [btn("❌ Отмена", callback_data="admin_back", style="danger")]]))
 
@@ -1223,7 +1183,7 @@ async def bc_copy(message: Message, state: FSMContext):
 async def bc_confirm(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     if not data.get("copy_message_id") and not data.get("bc_text"):
-        return await call.answer("Нет данных для рассылки, начни заново.", show_alert=True)
+        return await call.answer("Нет данных", show_alert=True)
     users = await get_all_users()
     if not users:
         return await call.answer("Нет пользователей", show_alert=True)
@@ -1235,39 +1195,25 @@ async def bc_confirm(call: CallbackQuery, state: FSMContext):
             [btn(data["bc_btn_text"], url=data["bc_btn_url"], style="primary")]])
     ok = fail = 0
     for i, uid in enumerate(users):
-        for attempt in (1, 2):
-            try:
-                if data.get("copy_message_id"):
-                    await bot.copy_message(uid, data["copy_from_chat"], data["copy_message_id"])
-                elif data.get("bc_photo"):
-                    await bot.send_photo(uid, data["bc_photo"], caption=data.get("bc_text", ""), reply_markup=markup)
-                else:
-                    await bot.send_message(uid, data.get("bc_text", ""), reply_markup=markup)
-                ok += 1
-                break
-            except TelegramRetryAfter as e:
-                if attempt == 1:
-                    await asyncio.sleep(e.retry_after + 1)
-                else:
-                    fail += 1
-            except TelegramForbiddenError:
-                await remove_user(uid)
-                fail += 1
-                break
-            except TelegramBadRequest as e:
-                if "deactivated" in str(e).lower():
-                    await remove_user(uid)
-                fail += 1
-                break
-            except Exception:
-                fail += 1
-                break
+        try:
+            if data.get("copy_message_id"):
+                await bot.copy_message(uid, data["copy_from_chat"], data["copy_message_id"])
+            elif data.get("bc_photo"):
+                await bot.send_photo(uid, data["bc_photo"], caption=data.get("bc_text", ""), reply_markup=markup)
+            else:
+                await bot.send_message(uid, data.get("bc_text", ""), reply_markup=markup)
+            ok += 1
+        except TelegramForbiddenError:
+            await remove_user(uid)
+            fail += 1
+        except Exception:
+            fail += 1
         if i % 20 == 0:
-            await safe_edit(call.message, f"📤 Рассылка... {i}/{len(users)}\n✅ {ok} · ❌ {fail}")
+            await safe_edit(call.message, f"📤 {i}/{len(users)} | ✅ {ok} · ❌ {fail}")
         await asyncio.sleep(0.05)
     await state.clear()
     await state.set_state(AdminStates.main)
-    await safe_edit(call.message, f"✅ <b>Рассылка завершена.</b>\n\nУспешно: {ok}\nОшибок: {fail}",
+    await safe_edit(call.message, f"✅ Готово!\n✅ {ok} · ❌ {fail}",
                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                         [btn("◀️ В админку", callback_data="admin_back", style="danger")]]))
 
@@ -1281,21 +1227,21 @@ async def start_health_server():
     await runner.setup()
     port = int(os.environ.get("PORT", "10000"))
     await web.TCPSite(runner, "0.0.0.0", port).start()
-    log.info("Health-сервер на порту %s", port)
+    log.info("Health на порту %s", port)
 
 # ---------- ЗАПУСК ----------
 async def main():
     global db_pool, BOT_USERNAME
-    log.info("ffmpeg: %s", "найден" if FFMPEG_OK else "не найден (видео-функции отключены)")
+    log.info("ffmpeg: %s", "найден" if FFMPEG_OK else "не найден")
     db_pool = await create_pool()
     await init_db()
     me = await bot.get_me()
     BOT_USERNAME = me.username or "bot"
-    await bot.set_my_commands([BotCommand(command="start", description="🚀 Запустить бота")])
+    await bot.set_my_commands([BotCommand(command="start", description="🚀 Старт")])
     if ADMIN_ID:
         try:
             await bot.set_my_commands(
-                [BotCommand(command="start", description="🚀 Запустить бота"),
+                [BotCommand(command="start", description="🚀 Старт"),
                  BotCommand(command="admin", description="🛠 Админка"),
                  BotCommand(command="clearcache", description="🗑 Очистить кэш")],
                 scope=BotCommandScopeChat(chat_id=ADMIN_ID))
