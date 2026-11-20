@@ -388,27 +388,49 @@ async def cb_check_sub(call: CallbackQuery, state: FSMContext):
         await call.answer("❌ Подписка не найдена. Подпишись и нажми ещё раз.", show_alert=True)
 
 # ---------- МУЗЫКА ----------
-def _sc_search(query: str) -> list[dict]:
+def _sc_search(query: str, title_hint: str | None = None) -> list[dict]:
+    queries = [query]
+    if title_hint:
+        th = title_hint.strip()
+        if th and norm(th) != norm(query):
+            queries.append(th)
     opts = {"quiet": True, "no_warnings": True, "noplaylist": True,
             "skip_download": True, "extract_flat": True, "socket_timeout": 30}
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(f"scsearch{SC_CANDIDATES}:{query}", download=False)
-    q = norm(query)
-    words = [w for w in q.split() if len(w) > 2]
-    out = []
-    for e in (info or {}).get("entries") or []:
-        if not e or not e.get("webpage_url"):
+    seen, entries = set(), []
+    for q in queries:
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(f"scsearch{SC_CANDIDATES}:{q}", download=False)
+        except Exception as e:
+            log.warning("search: %s", e)
             continue
+        for e in (info or {}).get("entries") or []:
+            u = e.get("webpage_url") if e else None
+            if u and u not in seen:
+                seen.add(u)
+                entries.append(e)
+    want = norm(title_hint or query)
+    want_words = [w for w in want.split() if len(w) > 2]
+    qn = norm(query)
+    out = []
+    for e in entries:
         dur = e.get("duration") or 0
         if dur and dur < 35:
             continue
-        cand = norm(f"{e.get('uploader', '')} {e.get('title', '')}")
-        score = SequenceMatcher(None, q, cand).ratio()
-        if words and all(w in cand for w in words):
-            score += 0.25
+        et = norm(e.get("title") or "")
+        eu = norm(e.get("uploader") or "")
+        if title_hint:
+            tsim = SequenceMatcher(None, want, et).ratio()
+            overlap = (sum(1 for w in want_words if w in et) / len(want_words)) if want_words else 0
+            match = max(tsim, overlap)
+        else:
+            match = SequenceMatcher(None, qn, f"{eu} {et}").ratio()
+            if want_words and all(w in f"{eu} {et}" for w in want_words):
+                match += 0.25
         out.append({"url": e["webpage_url"], "title": e.get("title") or "Трек",
-                    "uploader": e.get("uploader") or "Исполнитель", "duration": dur, "score": score})
-    out.sort(key=lambda x: x["score"], reverse=True)
+                    "uploader": e.get("uploader") or "Исполнитель",
+                    "duration": dur, "match": match})
+    out.sort(key=lambda x: x["match"], reverse=True)
     return out
 
 def _sc_download(url: str, tmp: str) -> tuple[Path, dict]:
@@ -507,14 +529,17 @@ async def process_music(message: Message, state: FSMContext, query: str,
         await safe_delete(progress)
         return
     await safe_edit(progress, "🔎 <b>Ищу трек...</b>")
+    title_hint = label.split(" – ", 1)[1].strip() if label and " – " in label else None
     try:
-        candidates = await asyncio.to_thread(_sc_search, query)
+        candidates = await asyncio.to_thread(_sc_search, query, title_hint)
     except Exception as e:
         log.warning("search: %s", e)
         candidates = []
+    if title_hint:
+        candidates = [c for c in candidates if c.get("match", 0) >= 0.5]
     if not candidates:
         text = (f"🎧 <b>Распознано:</b> {esc(label)}\n\n" if label else "")
-        text += "😔 Не нашёл файл для скачивания. Попробуй ввести название вручную."
+        text += "😔 Не нашёл именно этот трек. Попробуй ввести название вручную."
         await safe_edit(progress, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [btn("✏️ Ввести название", callback_data="sc_manual", style="primary")],
             [btn("◀️ В меню", callback_data="main_menu", style="danger")]]))
