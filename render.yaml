@@ -1,7 +1,18 @@
 services:
-  - type: worker
-    name: anime-finder-bot
-    env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+  - type: web
+    name: anime-music-bot
+    runtime: docker
     plan: free
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: TRACEMOE_TOKEN
+        sync: false
+      - key: SAUCENAO_KEY
+        sync: false
