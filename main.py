@@ -392,7 +392,7 @@ async def cb_check_sub(call: CallbackQuery, state: FSMContext):
 
 # ---------- МУЗЫКА ----------
 def _sc_search(query: str, title_hint: str | None = None) -> list[dict]:
-    """Поиск треков на YouTube + SoundCloud."""
+    """Поиск треков: SoundCloud → VK → YouTube (резерв)."""
     queries = [query]
     if title_hint:
         th = title_hint.strip()
@@ -405,34 +405,46 @@ def _sc_search(query: str, title_hint: str | None = None) -> list[dict]:
     }
     seen, entries = set(), []
 
-    # 1. YouTube (там есть ВСЁ)
+    # 1. SoundCloud (работает на Render без блокировок)
     for q in queries:
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(f"ytsearch{SC_CANDIDATES}:{q}", download=False)
-        except Exception as e:
-            log.warning("ytsearch: %s", e)
-            continue
-        for e in (info or {}).get("entries") or []:
-            u = e.get("webpage_url") if e else None
-            if u and u not in seen:
-                seen.add(u)
-                entries.append({**e, "source": "youtube"})
-
-    # 2. SoundCloud (дополнительно)
-    if len(entries) < 3:
-        for q in queries:
-            try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(f"scsearch{SC_CANDIDATES}:{q}", download=False)
-            except Exception as e:
-                log.warning("scsearch: %s", e)
-                continue
+                info = ydl.extract_info(f"scsearch{SC_CANDIDATES}:{q}", download=False)
             for e in (info or {}).get("entries") or []:
                 u = e.get("webpage_url") if e else None
                 if u and u not in seen:
                     seen.add(u)
                     entries.append({**e, "source": "soundcloud"})
+        except Exception as e:
+            log.warning("scsearch: %s", e)
+
+    # 2. VK (тоже работает на облаке)
+    if len(entries) < 3:
+        for q in queries:
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(f"vksearch{SC_CANDIDATES}:{q}", download=False)
+                for e in (info or {}).get("entries") or []:
+                    u = e.get("webpage_url") if e else None
+                    if u and u not in seen:
+                        seen.add(u)
+                        entries.append({**e, "source": "vk"})
+            except Exception as e:
+                log.warning("vksearch: %s", e)
+
+    # 3. YouTube (резерв, может блокировать)
+    if len(entries) < 3:
+        for q in queries:
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(f"ytsearch{SC_CANDIDATES}:{q}", download=False)
+                for e in (info or {}).get("entries") or []:
+                    u = e.get("webpage_url") if e else None
+                    if u and u not in seen:
+                        seen.add(u)
+                        entries.append({**e, "source": "youtube"})
+            except Exception as e:
+                log.warning("ytsearch: %s", e)
 
     want = norm(title_hint or query)
     want_words = [w for w in want.split() if len(w) > 2]
@@ -458,16 +470,23 @@ def _sc_search(query: str, title_hint: str | None = None) -> list[dict]:
             "uploader": e.get("uploader") or "Исполнитель",
             "duration": dur,
             "match": match,
-            "source": e.get("source", "youtube"),
+            "source": e.get("source", "unknown"),
         })
     out.sort(key=lambda x: x["match"], reverse=True)
     return out
 
 def _sc_download(url: str, tmp: str) -> tuple[Path, dict]:
-    opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "socket_timeout": 30,
-            "retries": 2, "max_filesize": TG_UPLOAD_LIMIT,
-            "format": "bestaudio[ext=mp3]/bestaudio/best",
-            "outtmpl": os.path.join(tmp, "track.%(ext)s")}
+    """Скачивает трек с обходом блокировок."""
+    opts = {
+        "quiet": True, "no_warnings": True, "noplaylist": True,
+        "socket_timeout": 30, "retries": 3,
+        "max_filesize": TG_UPLOAD_LIMIT,
+        "format": "bestaudio[ext=mp3]/bestaudio/best",
+        "outtmpl": os.path.join(tmp, "track.%(ext)s"),
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+    }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
     files = sorted(Path(tmp).glob("track.*"))
@@ -487,7 +506,6 @@ def _clip_download(url: str, tmp: str) -> Path:
     return files[0]
 
 async def shazam_recognize(path: Path) -> tuple[str, str] | None:
-    """Распознаёт трек через Shazam. Возвращает (artist, title) или None."""
     try:
         async with Shazam() as sh:
             out = await sh.recognize(str(path))
@@ -507,7 +525,6 @@ async def shazam_recognize(path: Path) -> tuple[str, str] | None:
 
 async def deliver_track(message: Message, state: FSMContext, cand: dict,
                         key: str, label: str | None, progress: Message) -> bool:
-    """Скачивает трек и отправляет файлом. ВСЕГДА пытается скачать."""
     tmp = tempfile.mkdtemp()
     try:
         await safe_edit(progress, "⬇️ <b>Скачиваю трек...</b>")
@@ -547,7 +564,6 @@ async def deliver_track(message: Message, state: FSMContext, cand: dict,
 
 async def process_music(message: Message, state: FSMContext, query: str,
                         label: str | None = None, progress: Message | None = None):
-    """Основная логика поиска музыки. ВСЕГДА скачивает файл."""
     progress = progress or await message.answer("🔎 <b>Ищу трек...</b>")
     key = norm(query)
     cached = await get_cached_track(key)
