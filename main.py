@@ -539,10 +539,155 @@ async def cb_alt_version(call: CallbackQuery, state: FSMContext):
     await state.update_data(sc_index=idx)
     progress = await call.message.answer("⬇️ <b>Скачиваю другую версию...</b>")
     ok = await deliver_track(call.message, state, cands[idx], data.get("sc_key", ""),
-                             data.get("sc_label"), progress)
+# ---------- МУЗЫКА: SoundCloud ----------
+def _sc_search(query: str) -> list[dict]:
+    opts = {"quiet": True, "no_warnings": True, "noplaylist": True,
+            "skip_download": True, "extract_flat": True, "socket_timeout": 30}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(f"scsearch{SC_CANDIDATES}:{query}", download=False)
+    q = norm(query)
+    words = [w for w in q.split() if len(w) > 2]
+    out = []
+    for e in (info or {}).get("entries") or []:
+        if not e or not e.get("webpage_url"):
+            continue
+        dur = e.get("duration") or 0
+        if dur and dur < 35:
+            continue
+        cand = norm(f"{e.get('uploader', '')} {e.get('title', '')}")
+        score = SequenceMatcher(None, q, cand).ratio()
+        if words and all(w in cand for w in words):
+            score += 0.25
+        out.append({"url": e["webpage_url"], "title": e.get("title") or "Трек",
+                    "uploader": e.get("uploader") or "SoundCloud", "duration": dur, "score": score})
+    out.sort(key=lambda x: x["score"], reverse=True)
+    return out
+
+def _sc_download(url: str, tmp: str) -> tuple[Path, dict]:
+    opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "socket_timeout": 30,
+            "retries": 2, "max_filesize": TG_UPLOAD_LIMIT,
+            "format": "bestaudio[ext=mp3]/bestaudio/best",
+            "outtmpl": os.path.join(tmp, "track.%(ext)s")}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+    files = sorted(Path(tmp).glob("track.*"))
+    if not files:
+        raise RuntimeError("файл не скачался")
+    return files[0], info or {}
+
+def _clip_download(url: str, tmp: str) -> Path:
+    opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "socket_timeout": 30,
+            "retries": 2, "max_filesize": 30 * 1024 * 1024,
+            "format": "bestaudio/best", "outtmpl": os.path.join(tmp, "clip.%(ext)s")}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.extract_info(url, download=True)
+    files = sorted(Path(tmp).glob("clip.*"))
+    if not files:
+        raise RuntimeError("не удалось скачать клип")
+    return files[0]
+
+async def shazam_recognize(path: Path) -> tuple[str, str] | None:
+    try:
+        async with Shazam() as sh:
+            out = await sh.recognize(str(path))
+    except Exception as e:
+        log.warning("shazam: %s", e)
+        return None
+    track = getattr(out, "track", None)
+    if track is None and isinstance(out, dict):
+        track = out.get("track")
+    if not track:
+        return None
+    get = (lambda k: track.get(k)) if isinstance(track, dict) else (lambda k: getattr(track, k, None))
+    title, subtitle = get("title"), get("subtitle")
+    if not title:
+        return None
+    return (subtitle or "").strip(), title.strip()
+
+async def deliver_track(message: Message, state: FSMContext, cand: dict,
+                        key: str, label: str | None) -> bool:
+    tmp = tempfile.mkdtemp()
+    try:
+        await bot.send_chat_action(message.chat.id, "upload_voice")
+        path, info = await asyncio.to_thread(_sc_download, cand["url"], tmp)
+        if path.stat().st_size > TG_UPLOAD_LIMIT:
+            return False
+        if path.suffix.lower() not in (".mp3", ".m4a"):
+            if not FFMPEG_OK:
+                return False
+            mp3 = path.with_suffix(".mp3")
+            await run_ffmpeg("-i", str(path), "-vn", "-c:a", "libmp3lame", "-b:a", "192k", str(mp3))
+            path = mp3
+        title = info.get("title") or cand["title"]
+        performer = info.get("uploader") or cand["uploader"]
+        duration = int(info.get("duration") or cand["duration"] or 0)
+        caption = (f"🎵 <b>{esc(title)}</b>\n👤 {esc(performer)}\n⏱ {fmt_dur(duration)}\n\n"
+                   f"📥 @{BOT_USERNAME}")
+        if label:
+            caption = f"🎧 <b>Распознано:</b> {esc(label)}\n\n" + caption
+        rows = []
+        data = await state.get_data()
+        if len(data.get("sc_candidates") or []) > 1:
+            rows.append([btn("🔁 Другая версия", callback_data="sc_alt", style="primary")])
+        rows.append([btn("◀️ В меню", callback_data="main_menu", style="danger")])
+        sent = await message.answer_audio(
+            audio=FSInputFile(str(path)), title=title[:64], performer=performer[:64],
+            duration=duration, caption=caption,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        if sent.audio:
+            await cache_track(key, sent.audio.file_id, title, performer)
+        return True
+    except Exception as e:
+        log.warning("deliver_track: %s", e)
+        return False
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+async def process_music(message: Message, state: FSMContext, query: str, label: str | None = None):
+    key = norm(query)
+    cached = await get_cached_track(key)
+    if cached:
+        caption = f"🎵 <b>{esc(cached['title'] or 'Трек')}</b>\n👤 {esc(cached['performer'] or '')}\n\n📥 @{BOT_USERNAME}"
+        if label:
+            caption = f"🎧 <b>Распознано:</b> {esc(label)}\n\n" + caption
+        await message.answer_audio(audio=cached["file_id"], title=(cached["title"] or "")[:64],
+                                   performer=(cached["performer"] or "")[:64], caption=caption,
+                                   reply_markup=back_kb())
+        return
+    await bot.send_chat_action(message.chat.id, "upload_voice")
+    try:
+        candidates = await asyncio.to_thread(_sc_search, query)
+    except Exception as e:
+        log.warning("sc_search: %s", e)
+        candidates = []
+    if not candidates:
+        text = (f"🎧 <b>Распознано:</b> {esc(label)}\n\n" if label else "")
+        text += "😔 Не нашёл файл для скачивания. Попробуй ввести название вручную."
+        await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [btn("✏️ Ввести название", callback_data="sc_manual", style="primary")],
+            [btn("◀️ В меню", callback_data="main_menu", style="danger")]]))
+        return
+    await state.update_data(sc_candidates=candidates, sc_index=0, sc_key=key, sc_label=label)
+    for i, cand in enumerate(candidates[:3]):
+        await state.update_data(sc_index=i)
+        if await deliver_track(message, state, cand, key, label):
+            return
+    await message.answer("😔 Не удалось скачать ни одну версию. Попробуй другое название.",
+                         reply_markup=back_kb())
+
+@user.callback_query(F.data == "sc_alt")
+async def cb_alt_version(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    cands = data.get("sc_candidates") or []
+    idx = int(data.get("sc_index", 0)) + 1
+    if not cands or idx >= len(cands):
+        return await call.answer("Больше версий нет 🤷", show_alert=True)
+    await call.answer("Ищу другую версию...")
+    await state.update_data(sc_index=idx)
+    ok = await deliver_track(call.message, state, cands[idx], data.get("sc_key", ""), data.get("sc_label"))
     if not ok:
-        await safe_edit(progress, "😔 Эта версия не скачалась. Попробуй ещё раз или введи название.",
-                        reply_markup=back_kb())
+        await call.message.answer("😔 Эта версия не скачалась. Попробуй ещё раз или введи название.",
+                                  reply_markup=back_kb())
 
 @user.callback_query(F.data == "sc_manual")
 async def cb_manual(call: CallbackQuery, state: FSMContext):
@@ -557,26 +702,25 @@ async def music_text(message: Message, state: FSMContext):
     if text.startswith(("http://", "https://")):
         if not FFMPEG_OK:
             return await message.answer(NO_FFMPEG_TEXT, reply_markup=back_kb())
-        progress = await message.answer("🔗 <b>Скачиваю клип и слушаю...</b>")
+        await bot.send_chat_action(message.chat.id, "upload_voice")
         tmp = tempfile.mkdtemp()
         try:
             clip = await asyncio.to_thread(_clip_download, text, tmp)
             audio = Path(tmp) / "audio.mp3"
             await run_ffmpeg("-i", str(clip), "-vn", "-ac", "1", "-ar", "16000",
                              "-c:a", "libmp3lame", "-b:a", "128k", str(audio))
-            await safe_edit(progress, "🎧 <b>Распознаю через Shazam...</b>")
             res = await shazam_recognize(audio)
             if not res:
-                return await safe_edit(progress, "😔 Не удалось распознать песню из клипа.",
-                                       reply_markup=back_kb())
+                return await message.answer("😔 Не удалось распознать песню из клипа.",
+                                            reply_markup=back_kb())
             artist, title = res
             label = f"{artist} – {title}" if artist else title
-            await process_music(message, state, f"{artist} {title}".strip(), label, progress)
+            await process_music(message, state, f"{artist} {title}".strip(), label)
         except Exception as e:
             log.warning("clip: %s", e)
-            await safe_edit(progress, "❌ Не удалось скачать клип по ссылке. "
-                                      "Пришли видео файлом (до 20 МБ) или название текстом.",
-                            reply_markup=back_kb())
+            await message.answer("❌ Не удалось скачать клип по ссылке. "
+                                 "Пришли видео файлом (до 20 МБ) или название текстом.",
+                                 reply_markup=back_kb())
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
         return
@@ -593,7 +737,7 @@ async def music_media(message: Message, state: FSMContext):
     is_video_input = bool(message.video or message.video_note or doc_mime.startswith("video/"))
     if is_video_input and not FFMPEG_OK:
         return await message.answer(NO_FFMPEG_TEXT, reply_markup=back_kb())
-    progress = await message.answer("🎧 <b>Слушаю...</b>")
+    await bot.send_chat_action(message.chat.id, "upload_voice")
     tmp = tempfile.mkdtemp()
     try:
         if message.voice: fid, ext = message.voice.file_id, ".ogg"
@@ -607,22 +751,20 @@ async def music_media(message: Message, state: FSMContext):
         need_convert = bool(is_video_input or ext not in (".ogg", ".mp3", ".m4a", ".wav", ".flac"))
         process_path = src
         if need_convert:
-            await safe_edit(progress, "🎬 <b>Извлекаю звук...</b>")
             process_path = Path(tmp) / "audio.mp3"
             await run_ffmpeg("-i", str(src), "-vn", "-ac", "1", "-ar", "16000",
                              "-c:a", "libmp3lame", "-b:a", "128k", str(process_path))
-        await safe_edit(progress, "🎧 <b>Распознаю через Shazam...</b>")
         res = await shazam_recognize(process_path)
         if not res:
-            return await safe_edit(progress, "😔 Не удалось распознать песню. "
-                                             "Попробуй запись подлиннее или напиши название.",
-                                   reply_markup=back_kb())
+            return await message.answer("😔 Не удалось распознать песню. "
+                                        "Попробуй запись подлиннее или напиши название.",
+                                        reply_markup=back_kb())
         artist, title = res
         label = f"{artist} – {title}" if artist else title
-        await process_music(message, state, f"{artist} {title}".strip(), label, progress)
+        await process_music(message, state, f"{artist} {title}".strip(), label)
     except Exception as e:
         log.warning("music_media: %s", e)
-        await safe_edit(progress, f"❌ Ошибка: {esc(str(e))[:200]}", reply_markup=back_kb())
+        await message.answer(f"❌ Ошибка: {esc(str(e))[:200]}", reply_markup=back_kb())
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
