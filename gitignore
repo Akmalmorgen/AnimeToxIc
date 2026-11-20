@@ -1,7 +1,0 @@
-__pycache__/
-*.pyc
-.env
-venv/
-*.mp3
-*.ogg
-*.mp4
