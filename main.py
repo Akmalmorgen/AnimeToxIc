@@ -68,7 +68,7 @@ db_pool: asyncpg.Pool | None = None
 BOT_USERNAME = "bot"
 
 # ---------- БРЕНД ----------
-FANCY_BRAND = "𝓐𝓷𝓲𝓶𝓮𝓫𝓸𝓽𝟏𝓴"  # красивая подпись вместо чужих имён
+FANCY_BRAND = "𝓐𝓷𝓲𝓶𝓮𝓫𝓸𝓽𝟏𝓴"
 
 # ---------- БАЗА ДАННЫХ ----------
 async def _conn_init(conn: asyncpg.Connection):
@@ -392,26 +392,48 @@ async def cb_check_sub(call: CallbackQuery, state: FSMContext):
 
 # ---------- МУЗЫКА ----------
 def _sc_search(query: str, title_hint: str | None = None) -> list[dict]:
+    """Поиск треков на YouTube + SoundCloud."""
     queries = [query]
     if title_hint:
         th = title_hint.strip()
         if th and norm(th) != norm(query):
             queries.append(th)
-    opts = {"quiet": True, "no_warnings": True, "noplaylist": True,
-            "skip_download": True, "extract_flat": True, "socket_timeout": 30}
+
+    opts = {
+        "quiet": True, "no_warnings": True, "noplaylist": True,
+        "skip_download": True, "extract_flat": True, "socket_timeout": 30,
+    }
     seen, entries = set(), []
+
+    # 1. YouTube (там есть ВСЁ)
     for q in queries:
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(f"scsearch{SC_CANDIDATES}:{q}", download=False)
+                info = ydl.extract_info(f"ytsearch{SC_CANDIDATES}:{q}", download=False)
         except Exception as e:
-            log.warning("search: %s", e)
+            log.warning("ytsearch: %s", e)
             continue
         for e in (info or {}).get("entries") or []:
             u = e.get("webpage_url") if e else None
             if u and u not in seen:
                 seen.add(u)
-                entries.append(e)
+                entries.append({**e, "source": "youtube"})
+
+    # 2. SoundCloud (дополнительно)
+    if len(entries) < 3:
+        for q in queries:
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(f"scsearch{SC_CANDIDATES}:{q}", download=False)
+            except Exception as e:
+                log.warning("scsearch: %s", e)
+                continue
+            for e in (info or {}).get("entries") or []:
+                u = e.get("webpage_url") if e else None
+                if u and u not in seen:
+                    seen.add(u)
+                    entries.append({**e, "source": "soundcloud"})
+
     want = norm(title_hint or query)
     want_words = [w for w in want.split() if len(w) > 2]
     qn = norm(query)
@@ -430,9 +452,14 @@ def _sc_search(query: str, title_hint: str | None = None) -> list[dict]:
             match = SequenceMatcher(None, qn, f"{eu} {et}").ratio()
             if want_words and all(w in f"{eu} {et}" for w in want_words):
                 match += 0.25
-        out.append({"url": e["webpage_url"], "title": e.get("title") or "Трек",
-                    "uploader": e.get("uploader") or "Исполнитель",
-                    "duration": dur, "match": match})
+        out.append({
+            "url": e["webpage_url"],
+            "title": e.get("title") or "Трек",
+            "uploader": e.get("uploader") or "Исполнитель",
+            "duration": dur,
+            "match": match,
+            "source": e.get("source", "youtube"),
+        })
     out.sort(key=lambda x: x["match"], reverse=True)
     return out
 
@@ -460,6 +487,7 @@ def _clip_download(url: str, tmp: str) -> Path:
     return files[0]
 
 async def shazam_recognize(path: Path) -> tuple[str, str] | None:
+    """Распознаёт трек через Shazam. Возвращает (artist, title) или None."""
     try:
         async with Shazam() as sh:
             out = await sh.recognize(str(path))
@@ -479,6 +507,7 @@ async def shazam_recognize(path: Path) -> tuple[str, str] | None:
 
 async def deliver_track(message: Message, state: FSMContext, cand: dict,
                         key: str, label: str | None, progress: Message) -> bool:
+    """Скачивает трек и отправляет файлом. ВСЕГДА пытается скачать."""
     tmp = tempfile.mkdtemp()
     try:
         await safe_edit(progress, "⬇️ <b>Скачиваю трек...</b>")
@@ -518,6 +547,7 @@ async def deliver_track(message: Message, state: FSMContext, cand: dict,
 
 async def process_music(message: Message, state: FSMContext, query: str,
                         label: str | None = None, progress: Message | None = None):
+    """Основная логика поиска музыки. ВСЕГДА скачивает файл."""
     progress = progress or await message.answer("🔎 <b>Ищу трек...</b>")
     key = norm(query)
     cached = await get_cached_track(key)
@@ -897,7 +927,6 @@ async def admin_entry(message: Message, state: FSMContext):
 
 @admin.message(Command("clearcache"))
 async def cmd_clearcache(message: Message, state: FSMContext):
-    """Очистка кэша треков и аниме. Только для админа."""
     try:
         async with db_pool.acquire() as conn:
             tracks = await conn.fetchval("SELECT COUNT(*) FROM track_cache")
@@ -923,7 +952,6 @@ async def cmd_clearcache(message: Message, state: FSMContext):
 
 @admin.callback_query(F.data == "clear_cache")
 async def cb_clear_cache(call: CallbackQuery, state: FSMContext):
-    """Очистка кэша через кнопку в админке."""
     await call.answer("Очищаю кэш...")
     try:
         async with db_pool.acquire() as conn:
