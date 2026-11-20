@@ -67,6 +67,9 @@ dp.include_router(user)
 db_pool: asyncpg.Pool | None = None
 BOT_USERNAME = "bot"
 
+# ---------- БРЕНД ----------
+FANCY_BRAND = "𝓐𝓷𝓲𝓶𝓮𝓫𝓸𝓽𝟏𝓴"  # красивая подпись вместо чужих имён
+
 # ---------- БАЗА ДАННЫХ ----------
 async def _conn_init(conn: asyncpg.Connection):
     await conn.set_type_codec("jsonb", encoder=json.dumps, decoder=json.loads, schema="pg_catalog")
@@ -489,9 +492,8 @@ async def deliver_track(message: Message, state: FSMContext, cand: dict,
             await run_ffmpeg("-i", str(path), "-vn", "-c:a", "libmp3lame", "-b:a", "192k", str(mp3))
             path = mp3
         title = info.get("title") or cand["title"]
-        performer = info.get("uploader") or cand["uploader"]
         duration = int(info.get("duration") or cand["duration"] or 0)
-        caption = (f"🎵 <b>{esc(title)}</b>\n👤 {esc(performer)}\n⏱ {fmt_dur(duration)}\n\n"
+        caption = (f"🎵 <b>{esc(title)}</b>\n👤 {FANCY_BRAND}\n⏱ {fmt_dur(duration)}\n\n"
                    f"📥 @{BOT_USERNAME}")
         if label:
             caption = f"🎧 <b>Распознано:</b> {esc(label)}\n\n" + caption
@@ -501,11 +503,11 @@ async def deliver_track(message: Message, state: FSMContext, cand: dict,
             rows.append([btn("🔁 Другая версия", callback_data="sc_alt", style="primary")])
         rows.append([btn("◀️ В меню", callback_data="main_menu", style="danger")])
         sent = await message.answer_audio(
-            audio=FSInputFile(str(path)), title=title[:64], performer=performer[:64],
+            audio=FSInputFile(str(path)), title=title[:64], performer=FANCY_BRAND,
             duration=duration, caption=caption,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
         if sent.audio:
-            await cache_track(key, sent.audio.file_id, title, performer)
+            await cache_track(key, sent.audio.file_id, title, FANCY_BRAND)
         await safe_delete(progress)
         return True
     except Exception as e:
@@ -520,11 +522,12 @@ async def process_music(message: Message, state: FSMContext, query: str,
     key = norm(query)
     cached = await get_cached_track(key)
     if cached:
-        caption = f"🎵 <b>{esc(cached['title'] or 'Трек')}</b>\n👤 {esc(cached['performer'] or '')}\n\n📥 @{BOT_USERNAME}"
+        caption = (f"🎵 <b>{esc(cached['title'] or 'Трек')}</b>\n👤 {FANCY_BRAND}\n\n"
+                   f"📥 @{BOT_USERNAME}")
         if label:
             caption = f"🎧 <b>Распознано:</b> {esc(label)}\n\n" + caption
         await message.answer_audio(audio=cached["file_id"], title=(cached["title"] or "")[:64],
-                                   performer=(cached["performer"] or "")[:64], caption=caption,
+                                   performer=FANCY_BRAND, caption=caption,
                                    reply_markup=back_kb())
         await safe_delete(progress)
         return
@@ -874,6 +877,7 @@ async def render_admin_panel(msg: Message, edit: bool):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [btn("📢 Рассылка", callback_data="bc_menu", style="primary")],
         [btn("🔒 Обязательная подписка", callback_data="sub_menu", style="success")],
+        [btn("🗑 Очистить кэш", callback_data="clear_cache", style="danger")],
         [btn("◀️ В меню", callback_data="main_menu", style="danger")]])
     text = "🛠 <b>Админ-панель</b>\n\nВыбери раздел:"
     if edit:
@@ -890,6 +894,59 @@ async def admin_entry(message: Message, state: FSMContext):
     await state.clear()
     await state.set_state(AdminStates.main)
     await render_admin_panel(message, edit=False)
+
+@admin.message(Command("clearcache"))
+async def cmd_clearcache(message: Message, state: FSMContext):
+    """Очистка кэша треков и аниме. Только для админа."""
+    try:
+        async with db_pool.acquire() as conn:
+            tracks = await conn.fetchval("SELECT COUNT(*) FROM track_cache")
+            animes = await conn.fetchval("SELECT COUNT(*) FROM anime_cache")
+            await conn.execute("TRUNCATE TABLE track_cache, anime_cache;")
+        await message.answer(
+            f"✅ <b>Кэш успешно очищен!</b>\n\n"
+            f"🗑 Удалено треков: <b>{tracks}</b>\n"
+            f"🗑 Удалено аниме: <b>{animes}</b>\n\n"
+            f"Теперь все новые запросы будут сохраняться с обновлённой подписью.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [btn("◀️ В админку", callback_data="admin_back", style="danger")]
+            ])
+        )
+    except Exception as e:
+        log.error("Ошибка очистки кэша: %s", e)
+        await message.answer(
+            f"❌ Ошибка при очистке кэша: {esc(str(e))[:200]}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [btn("◀️ В админку", callback_data="admin_back", style="danger")]
+            ])
+        )
+
+@admin.callback_query(F.data == "clear_cache")
+async def cb_clear_cache(call: CallbackQuery, state: FSMContext):
+    """Очистка кэша через кнопку в админке."""
+    await call.answer("Очищаю кэш...")
+    try:
+        async with db_pool.acquire() as conn:
+            tracks = await conn.fetchval("SELECT COUNT(*) FROM track_cache")
+            animes = await conn.fetchval("SELECT COUNT(*) FROM anime_cache")
+            await conn.execute("TRUNCATE TABLE track_cache, anime_cache;")
+        await call.message.edit_text(
+            f"✅ <b>Кэш успешно очищен!</b>\n\n"
+            f"🗑 Удалено треков: <b>{tracks}</b>\n"
+            f"🗑 Удалено аниме: <b>{animes}</b>\n\n"
+            f"Теперь все новые запросы будут сохраняться с обновлённой подписью.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [btn("◀️ В админку", callback_data="admin_back", style="danger")]
+            ])
+        )
+    except Exception as e:
+        log.error("Ошибка очистки кэша: %s", e)
+        await call.message.edit_text(
+            f"❌ Ошибка при очистке кэша: {esc(str(e))[:200]}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [btn("◀️ В админку", callback_data="admin_back", style="danger")]
+            ])
+        )
 
 @admin.callback_query(F.data == "admin_back")
 async def admin_back(call: CallbackQuery, state: FSMContext):
@@ -1182,7 +1239,8 @@ async def main():
         try:
             await bot.set_my_commands(
                 [BotCommand(command="start", description="🚀 Запустить бота"),
-                 BotCommand(command="admin", description="🛠 Админка")],
+                 BotCommand(command="admin", description="🛠 Админка"),
+                 BotCommand(command="clearcache", description="🗑 Очистить кэш")],
                 scope=BotCommandScopeChat(chat_id=ADMIN_ID))
         except Exception: pass
     asyncio.create_task(start_health_server())
