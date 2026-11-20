@@ -8,6 +8,8 @@ import shutil
 import sys
 import tempfile
 import time
+import urllib.request
+import urllib.parse
 from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
@@ -391,95 +393,105 @@ async def cb_check_sub(call: CallbackQuery, state: FSMContext):
         await call.answer("❌ Подписка не найдена. Подпишись и нажми ещё раз.", show_alert=True)
 
 # ---------- МУЗЫКА ----------
+
+def _deezer_search(query: str) -> list[dict]:
+    """Поиск через Deezer API — есть ВСЯ музыка мира (узбекская, русская, любая)."""
+    results = []
+    try:
+        url = f"https://api.deezer.com/search?q={urllib.parse.quote(query)}&limit=10"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        for track in data.get("data", []):
+            artist = track.get("artist", {}).get("name", "")
+            title = track.get("title", "")
+            duration = track.get("duration", 0)
+            if duration < 30:
+                continue
+            results.append({
+                "title": title,
+                "uploader": artist,
+                "duration": duration,
+                "yt_query": f"{artist} - {title}",
+                "source": "deezer",
+            })
+    except Exception as e:
+        log.warning("deezer search: %s", e)
+    return results
+
+def _yt_search_for_query(yt_query: str) -> str | None:
+    """Ищет видео на YouTube по запросу и возвращает URL."""
+    try:
+        opts = {
+            "quiet": True, "no_warnings": True, "noplaylist": True,
+            "skip_download": True, "extract_flat": True, "socket_timeout": 30,
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"ytsearch1:{yt_query}", download=False)
+        if info and info.get("entries"):
+            video = info["entries"][0]
+            return video.get("webpage_url")
+    except Exception as e:
+        log.warning("yt search: %s", e)
+    return None
+
 def _sc_search(query: str, title_hint: str | None = None) -> list[dict]:
-    """Поиск треков: SoundCloud → VK → YouTube (резерв)."""
+    """Поиск: Deezer (вся музыка) → YouTube для скачивания."""
     queries = [query]
     if title_hint:
         th = title_hint.strip()
         if th and norm(th) != norm(query):
             queries.append(th)
 
-    opts = {
-        "quiet": True, "no_warnings": True, "noplaylist": True,
-        "skip_download": True, "extract_flat": True, "socket_timeout": 30,
-    }
-    seen, entries = set(), []
+    seen_queries = set()
+    candidates = []
 
-    # 1. SoundCloud (работает на Render без блокировок)
+    # 1. Ищем через Deezer (есть узбекская музыка и всё остальное)
     for q in queries:
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(f"scsearch{SC_CANDIDATES}:{q}", download=False)
-            for e in (info or {}).get("entries") or []:
-                u = e.get("webpage_url") if e else None
-                if u and u not in seen:
-                    seen.add(u)
-                    entries.append({**e, "source": "soundcloud"})
-        except Exception as e:
-            log.warning("scsearch: %s", e)
+        for track in _deezer_search(q):
+            if track["yt_query"] not in seen_queries:
+                seen_queries.add(track["yt_query"])
+                candidates.append(track)
 
-    # 2. VK (тоже работает на облаке)
-    if len(entries) < 3:
+    # 2. Для каждого результата ищем URL на YouTube
+    final = []
+    for c in candidates:
+        url = _yt_search_for_query(c["yt_query"])
+        if url:
+            final.append({
+                "url": url,
+                "title": c["title"],
+                "uploader": c["uploader"],
+                "duration": c["duration"],
+                "match": 1.0,
+                "source": c["source"],
+            })
+        if len(final) >= 3:
+            break
+
+    # 3. Если Deezer не дал результатов — ищем напрямую на YouTube
+    if not final:
         for q in queries:
-            try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(f"vksearch{SC_CANDIDATES}:{q}", download=False)
-                for e in (info or {}).get("entries") or []:
-                    u = e.get("webpage_url") if e else None
-                    if u and u not in seen:
-                        seen.add(u)
-                        entries.append({**e, "source": "vk"})
-            except Exception as e:
-                log.warning("vksearch: %s", e)
+            url = _yt_search_for_query(q)
+            if url:
+                final.append({
+                    "url": url,
+                    "title": q,
+                    "uploader": "Неизвестно",
+                    "duration": 0,
+                    "match": 0.5,
+                    "source": "youtube",
+                })
+            if len(final) >= 3:
+                break
 
-    # 3. YouTube (резерв, может блокировать)
-    if len(entries) < 3:
-        for q in queries:
-            try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(f"ytsearch{SC_CANDIDATES}:{q}", download=False)
-                for e in (info or {}).get("entries") or []:
-                    u = e.get("webpage_url") if e else None
-                    if u and u not in seen:
-                        seen.add(u)
-                        entries.append({**e, "source": "youtube"})
-            except Exception as e:
-                log.warning("ytsearch: %s", e)
-
-    want = norm(title_hint or query)
-    want_words = [w for w in want.split() if len(w) > 2]
-    qn = norm(query)
-    out = []
-    for e in entries:
-        dur = e.get("duration") or 0
-        if dur and dur < 35:
-            continue
-        et = norm(e.get("title") or "")
-        eu = norm(e.get("uploader") or "")
-        if title_hint:
-            tsim = SequenceMatcher(None, want, et).ratio()
-            overlap = (sum(1 for w in want_words if w in et) / len(want_words)) if want_words else 0
-            match = max(tsim, overlap)
-        else:
-            match = SequenceMatcher(None, qn, f"{eu} {et}").ratio()
-            if want_words and all(w in f"{eu} {et}" for w in want_words):
-                match += 0.25
-        out.append({
-            "url": e["webpage_url"],
-            "title": e.get("title") or "Трек",
-            "uploader": e.get("uploader") or "Исполнитель",
-            "duration": dur,
-            "match": match,
-            "source": e.get("source", "unknown"),
-        })
-    out.sort(key=lambda x: x["match"], reverse=True)
-    return out
+    return final
 
 def _sc_download(url: str, tmp: str) -> tuple[Path, dict]:
-    """Скачивает трек с обходом блокировок."""
+    """Скачивает трек с YouTube."""
     opts = {
         "quiet": True, "no_warnings": True, "noplaylist": True,
-        "socket_timeout": 30, "retries": 3,
+        "socket_timeout": 60, "retries": 3,
         "max_filesize": TG_UPLOAD_LIMIT,
         "format": "bestaudio[ext=mp3]/bestaudio/best",
         "outtmpl": os.path.join(tmp, "track.%(ext)s"),
@@ -506,6 +518,7 @@ def _clip_download(url: str, tmp: str) -> Path:
     return files[0]
 
 async def shazam_recognize(path: Path) -> tuple[str, str] | None:
+    """Распознаёт трек через Shazam. Возвращает (artist, title) или None."""
     try:
         async with Shazam() as sh:
             out = await sh.recognize(str(path))
@@ -525,6 +538,7 @@ async def shazam_recognize(path: Path) -> tuple[str, str] | None:
 
 async def deliver_track(message: Message, state: FSMContext, cand: dict,
                         key: str, label: str | None, progress: Message) -> bool:
+    """Скачивает трек и отправляет ФАЙЛОМ (не ссылкой!)."""
     tmp = tempfile.mkdtemp()
     try:
         await safe_edit(progress, "⬇️ <b>Скачиваю трек...</b>")
@@ -564,11 +578,12 @@ async def deliver_track(message: Message, state: FSMContext, cand: dict,
 
 async def process_music(message: Message, state: FSMContext, query: str,
                         label: str | None = None, progress: Message | None = None):
+    """Основная логика поиска музыки. ВСЕГДА скачивает файл."""
     progress = progress or await message.answer("🔎 <b>Ищу трек...</b>")
     key = norm(query)
     cached = await get_cached_track(key)
     if cached:
-        caption = (f"🎵 <b>{esc(cached['title'] or 'Трек')}</b>\n👤 {FANCY_BRAND}\n\n"
+        caption = (f"🎵 <b>{esc(cached['title'] or 'Трек')}</b>\n👤 {FANCY_BRAND}\n⏱ {fmt_dur(0)}\n\n"
                    f"📥 @{BOT_USERNAME}")
         if label:
             caption = f"🎧 <b>Распознано:</b> {esc(label)}\n\n" + caption
@@ -584,8 +599,6 @@ async def process_music(message: Message, state: FSMContext, query: str,
     except Exception as e:
         log.warning("search: %s", e)
         candidates = []
-    if title_hint:
-        candidates = [c for c in candidates if c.get("match", 0) >= 0.5]
     if not candidates:
         text = (f"🎧 <b>Распознано:</b> {esc(label)}\n\n" if label else "")
         text += "😔 Не нашёл именно этот трек. Попробуй ввести название вручную."
