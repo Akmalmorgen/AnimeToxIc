@@ -202,9 +202,9 @@ async def start(message: Message, state: FSMContext):
     welcome_text = (
         "✨ Добро пожаловать в <b>Аниʍᴇ Пᴏиᴄᴋ | Муɜыᴋᴀ</b>!\n\n"
         "👋 Привет, <b>{name}</b>!\n\n"
-        "Я помогу найти аниме по кадру и распознать любой трек.\n\n"
+        "Я помогу найти аниме по кадру и скачать любой трек.\n\n"
         "🖼 <b>Аниме</b> — кидай скриншот или видео\n"
-        "🎵 <b>Музыка</b> — отправь голосовое, видео или просто напиши название песни\n\n"
+        "🎵 <b>Музыка</b> — напиши название песни или отправь голосовое\n\n"
         "👇 Выбирай нужную кнопку внизу:"
     ).format(name=message.from_user.first_name)
 
@@ -281,8 +281,8 @@ async def anime_menu(message: Message, state: FSMContext):
     await state.set_state(UserStates.waiting_anime)
     await message.answer(
         "🖼 <b>Поиск аниме по кадру</b>\n\n"
-        "📌 <b>Что нужно:</b> Отправь мне <b>скриншот</b> или <b>видео</b> из аниме.\n\n"
-        "⚠️ <b>Важно:</b> Я ищу только реальные кадры из аниме. Фанарты и AI-арт я найти не смогу.",
+        "📌 <b>Что нужно:</b> Отправь мне <b>полный и необрезанный</b> скриншот (16:9) или видео из аниме.\n\n"
+        "⚠️ <b>Важно:</b> Я не смогу найти аниме, если кадр обрезан, содержит много текста/субтитров или это фанарт.",
         reply_markup=back_inline_kb()
     )
 
@@ -313,7 +313,8 @@ async def handle_anime_search(message: Message, state: FSMContext):
         
         if is_video:
             await msg.edit_text("🎬 <b>Извлекаю кадры из видео...</b>")
-            timestamps = [1, 3, 5]
+            # Извлекаем 5 кадров для повышения шансов
+            timestamps = [1, 3, 5, 7, 9]
             for ts in timestamps:
                 frame_path = os.path.join(tmp_dir, f"frame_{ts}.jpg")
                 os.system(f"ffmpeg -i {input_path} -ss 00:00:0{ts}.000 -vframes 1 -q:v 2 {frame_path} -y -loglevel quiet")
@@ -368,6 +369,7 @@ async def handle_anime_search(message: Message, state: FSMContext):
             f"{warning}"
         )
         
+        # Отправляем обложку
         cover_url = None
         if best_result.get("anilist") and isinstance(best_result["anilist"], dict):
             cover_url = best_result["anilist"].get("coverImage", {}).get("large")
@@ -378,6 +380,13 @@ async def handle_anime_search(message: Message, state: FSMContext):
             await message.answer_photo(best_result["image"], caption=text)
         else:
             await message.answer(text)
+
+        # Если есть видео-отрывок, отправляем и его
+        if best_result.get("video"):
+            try:
+                await message.answer_video(best_result["video"], caption="🎬 Отрывок из аниме")
+            except Exception:
+                pass # Игнорируем, если видео не отправилось
         
         await msg.delete()
         
@@ -411,54 +420,73 @@ async def handle_anime_link(message: Message, state: FSMContext):
                 else:
                     await msg.edit_text("❌ Не удалось загрузить изображение по ссылке.")
 
-# ---------- ПОИСК МУЗЫКИ ----------
+# ---------- ПОИСК МУЗЫКИ (ПОЛНЫЙ ТРЕК) ----------
+async def search_music_api(query):
+    """Ищет трек через MusicAPI и возвращает ссылку на аудио."""
+    try:
+        # 1. Получаем ID песни
+        prepare_url = f"https://bhindi1.ddns.net/music/api/prepare/{urllib.parse.quote(query)}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(prepare_url, timeout=10) as resp:
+                if resp.status != 200:
+                    return None
+                prepare_data = await resp.json()
+                song_id = prepare_data.get("id")
+                if not song_id:
+                    return None
+
+        # 2. Получаем данные по ID
+        fetch_url = f"https://bhindi1.ddns.net/music/api/fetch/{song_id}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(fetch_url, timeout=10) as resp:
+                if resp.status != 200:
+                    return None
+                fetch_data = await resp.json()
+                # Ищем прямую ссылку на аудио
+                audio_url = fetch_data.get("audio_url")
+                title = fetch_data.get("title", query)
+                artist = fetch_data.get("artist", "Неизвестен")
+                if audio_url:
+                    return {"audio_url": audio_url, "title": title, "artist": artist}
+    except Exception:
+        return None
+
 @router.message(F.text == "🎵 Поиск музыки")
 async def music_menu(message: Message, state: FSMContext):
     await state.set_state(UserStates.waiting_music)
     await message.answer(
-        "🎵 <b>Поиск музыки</b>\n\n"
+        "🎵 <b>Поиск и скачивание музыки</b>\n\n"
         "📌 <b>Что можно отправить:</b>\n"
-        "• 📝 <b>Название песни</b> (текстом)\n"
-        "• 🎤 Голосовое или аудио (найду через Shazam)\n"
-        "• 🎬 Видеофайл (вытащу звук и найду)",
+        "• 📝 <b>Название песни</b> (текстом, я скачаю полный трек)\n"
+        "• 🎤 Голосовое или аудио (распознаю через Shazam)\n"
+        "• 🎬 Видеофайл (вытащу звук и распознаю)",
         reply_markup=cancel_inline_kb()
     )
 
 @router.message(UserStates.waiting_music, F.text)
 async def handle_music_text(message: Message, state: FSMContext):
     if message.text.startswith("http"):
-        return await message.answer("🔗 Отправка ссылок отключена. Отправь название песни текстом или аудио.", reply_markup=cancel_inline_kb())
+        return await message.answer("🔗 Отправка ссылок отключена. Напиши название песни текстом.", reply_markup=cancel_inline_kb())
     
-    msg = await message.answer("🔎 <b>Ищу трек...</b>")
+    query = message.text.strip()
+    msg = await message.answer(f"🔎 <b>Ищу трек: {query}</b>\n\n⏳ Это может занять несколько секунд...")
+    
     try:
-        url = f"https://api.deezer.com/search?q={urllib.parse.quote(message.text)}"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=10) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("data"):
-                        track = data["data"][0]
-                        title = track["title"]
-                        artist = track["artist"]["name"]
-                        preview = track.get("preview")
-                        cover = track["album"]["cover_medium"]
-
-                        if preview:
-                            await message.answer_audio(
-                                audio=URLInputFile(preview, filename=f"{artist} - {title}.mp3"),
-                                title=title,
-                                performer=artist,
-                                thumb=URLInputFile(cover)
-                            )
-                            await msg.delete()
-                        else:
-                            await msg.edit_text(f"🎵 <b>{title}</b>\n👤 {artist}\n\n<i>Превью недоступно для этого трека.</i>", reply_markup=back_inline_kb())
-                    else:
-                        await msg.edit_text("😔 Ничего не найдено.", reply_markup=back_inline_kb())
-                else:
-                    await msg.edit_text("❌ Ошибка API поиска музыки.", reply_markup=back_inline_kb())
+        result = await search_music_api(query)
+        if result:
+            await msg.edit_text("✅ <b>Трек найден!</b> Отправляю...")
+            await message.answer_audio(
+                audio=URLInputFile(result["audio_url"], filename=f"{result['artist']} - {result['title']}.mp3"),
+                title=result["title"],
+                performer=result["artist"],
+                caption=f"🎵 <b>{result['artist']} - {result['title']}</b>\n\n📥 Скачано через @{BOT_USERNAME}"
+            )
+            await msg.delete()
+            return
+        else:
+            await msg.edit_text("😔 <b>Не удалось найти трек.</b>\nПопробуй изменить название.", reply_markup=back_inline_kb())
     except Exception as e:
-        await msg.edit_text(f"❌ Ошибка: {e}", reply_markup=back_inline_kb())
+        await msg.edit_text(f"❌ Ошибка при скачивании: {e}", reply_markup=back_inline_kb())
 
 @router.message(UserStates.waiting_music, F.voice | F.audio | F.video)
 async def handle_music_media(message: Message, state: FSMContext):
@@ -484,9 +512,27 @@ async def handle_music_media(message: Message, state: FSMContext):
         anim_task.cancel()
         if not out.get("track"): return await msg.edit_text("😔 Не удалось распознать песню.", reply_markup=back_inline_kb())
         track = Serialize.full_track(out).track
-        text = f"🎵 <b>{track.title}</b>\n👤 {track.subtitle}"
-        kb = InlineKeyboardMarkup(inline_keyboard=[[btn("▶️ YouTube", url=track.youtube_link, style="danger")], [btn("◀️ Назад в меню", callback_data="main_menu", style="danger")]]) if track.youtube_link else back_inline_kb()
-        await msg.edit_text(text, reply_markup=kb)
+        
+        await msg.edit_text(f"🎵 <b>Распознано:</b> {track.title}\n\n⏳ Ищу полный трек...")
+        
+        query = f"{track.subtitle} - {track.title}"
+        result = await search_music_api(query)
+        if result:
+            await msg.edit_text("✅ <b>Трек найден!</b> Отправляю...")
+            await message.answer_audio(
+                audio=URLInputFile(result["audio_url"], filename=f"{result['artist']} - {result['title']}.mp3"),
+                title=result["title"],
+                performer=result["artist"],
+                caption=f"🎵 <b>{result['artist']} - {result['title']}</b>\n\n📥 Скачано через @{BOT_USERNAME}"
+            )
+            await msg.delete()
+            return
+        else:
+            # Если полный трек не нашли, отправляем хотя бы информацию
+            text = f"🎵 <b>{track.title}</b>\n👤 {track.subtitle}\n\n<i>Не удалось скачать полный трек, но я его распознал!</i>"
+            kb = InlineKeyboardMarkup(inline_keyboard=[[btn("▶️ YouTube", url=track.youtube_link, style="danger")], [btn("◀️ Назад в меню", callback_data="main_menu", style="danger")]]) if track.youtube_link else back_inline_kb()
+            await msg.edit_text(text, reply_markup=kb)
+
     except Exception as e:
         anim_task.cancel()
         await msg.edit_text(f"❌ Ошибка: {e}", reply_markup=back_inline_kb())
