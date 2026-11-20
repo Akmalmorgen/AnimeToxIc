@@ -23,6 +23,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
 from shazamio import Shazam, Serialize
+import yt_dlp
 
 # ---------- КОНФИГУРАЦИЯ ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -117,7 +118,7 @@ class AdminStates(StatesGroup):
 
 class UserStates(StatesGroup):
     waiting_music = State()
-    waiting_anime = State()
+    waiting_media = State() # Изменено с waiting_anime на waiting_media
 
 # ---------- ХЕЛПЕР ДЛЯ INLINE-КНОПОК ----------
 def btn(text, callback_data=None, url=None, style=None):
@@ -171,7 +172,7 @@ dp.callback_query.middleware(SubscriptionMiddleware())
 # ---------- КЛАВИАТУРЫ ----------
 def main_menu_reply(user_id):
     kb = [
-        [KeyboardButton(text="🖼 Поиск аниме"), KeyboardButton(text="🎵 Поиск музыки")]
+        [KeyboardButton(text="🖼 Поиск по кадру/видео"), KeyboardButton(text="🎵 Поиск музыки")]
     ]
     if user_id == ADMIN_ID:
         kb.append([KeyboardButton(text="🛠 Админка")])
@@ -202,9 +203,9 @@ async def start(message: Message, state: FSMContext):
     welcome_text = (
         "✨ Добро пожаловать в <b>Аниʍᴇ Пᴏиᴄᴋ | Муɜыᴋᴀ</b>!\n\n"
         "👋 Привет, <b>{name}</b>!\n\n"
-        "Я помогу найти аниме по кадру и скачать любой трек.\n\n"
-        "🖼 <b>Аниме</b> — кидай скриншот или видео\n"
-        "🎵 <b>Музыка</b> — напиши название песни или отправь голосовое\n\n"
+        "Я помогу найти аниме, фильм или мультфильм по кадру, а также скачать любой трек.\n\n"
+        "🖼 <b>Поиск по кадру</b> — кидай скриншот или видео\n"
+        "🎵 <b>Поиск музыки</b> — напиши название песни или отправь голосовое\n\n"
         "👇 Выбирай нужную кнопку внизу:"
     ).format(name=message.from_user.first_name)
 
@@ -224,7 +225,7 @@ async def check_sub_cb(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text("✅ Отлично! Доступ открыт.")
     await call.message.answer("🏠 <b>Главное меню</b>", reply_markup=main_menu_reply(call.from_user.id))
 
-# ---------- ПОИСК АНИМЕ (С МУЛЬТИ-КАДРАМИ И ОБЛОЖКАМИ) ----------
+# ---------- ПОИСК ПО КАДРУ/ВИДЕО (АНИМЕ, ФИЛЬМЫ, МУЛЬТФИЛЬМЫ) ----------
 async def get_ru_title(anime_data):
     title = None
     year = None
@@ -276,18 +277,40 @@ async def search_tracemoe_api(image_bytes):
                 return await resp.json()
         except Exception as e: return {"error": str(e)}
 
-@router.message(F.text == "🖼 Поиск аниме")
-async def anime_menu(message: Message, state: FSMContext):
-    await state.set_state(UserStates.waiting_anime)
+async def search_find_scene_api(image_bytes):
+    """Поиск фильмов и мультфильмов через find-scene API."""
+    # ВАЖНО: Для использования этого API может потребоваться бесплатный ключ.
+    # Зарегистрируйтесь на https://find-scene.com и получите его.
+    # Затем добавьте ключ в переменные окружения на Render как FIND_SCENE_API_KEY
+    FIND_SCENE_API_KEY = os.getenv("FIND_SCENE_API_KEY", "")
+    if not FIND_SCENE_API_KEY:
+        return {"error": "Ключ FIND_SCENE_API_KEY не указан. Поиск фильмов и мультфильмов временно недоступен."}
+    
+    async with aiohttp.ClientSession() as session:
+        url = "https://api.find-scene.com/search"
+        headers = {"Authorization": f"Bearer {FIND_SCENE_API_KEY}"}
+        try:
+            form = aiohttp.FormData()
+            form.add_field('file', image_bytes, filename='image.jpg')
+            async with session.post(url, data=form, headers=headers, timeout=15) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                return {"error": f"Ошибка API find-scene: {resp.status}"}
+        except Exception as e:
+            return {"error": str(e)}
+
+@router.message(F.text == "🖼 Поиск по кадру/видео")
+async def media_menu(message: Message, state: FSMContext):
+    await state.set_state(UserStates.waiting_media)
     await message.answer(
-        "🖼 <b>Поиск аниме по кадру</b>\n\n"
-        "📌 <b>Что нужно:</b> Отправь мне <b>полный и необрезанный</b> скриншот (16:9) или видео из аниме.\n\n"
-        "⚠️ <b>Важно:</b> Я не смогу найти аниме, если кадр обрезан, содержит много текста/субтитров или это фанарт.",
+        "🖼 <b>Поиск по кадру/видео</b>\n\n"
+        "📌 <b>Что нужно:</b> Отправь мне <b>скриншот</b> или <b>видео</b>.\n\n"
+        "Я ищу аниме, фильмы и мультфильмы. Если ничего не найдено, попробуй другой кадр.",
         reply_markup=back_inline_kb()
     )
 
-@router.message(UserStates.waiting_anime, F.photo | F.video | F.document)
-async def handle_anime_search(message: Message, state: FSMContext):
+@router.message(UserStates.waiting_media, F.photo | F.video | F.document)
+async def handle_media_search(message: Message, state: FSMContext):
     file_id = None
     is_video = False
     
@@ -301,7 +324,7 @@ async def handle_anime_search(message: Message, state: FSMContext):
     else: 
         return
 
-    msg = await message.answer("🔍 <b>Ищу аниме...</b>")
+    msg = await message.answer("🔍 <b>Ищу...</b>")
     tmp_dir = tempfile.mkdtemp()
     
     try:
@@ -313,7 +336,6 @@ async def handle_anime_search(message: Message, state: FSMContext):
         
         if is_video:
             await msg.edit_text("🎬 <b>Извлекаю кадры из видео...</b>")
-            # Извлекаем 5 кадров для повышения шансов
             timestamps = [1, 3, 5, 7, 9]
             for ts in timestamps:
                 frame_path = os.path.join(tmp_dir, f"frame_{ts}.jpg")
@@ -335,6 +357,7 @@ async def handle_anime_search(message: Message, state: FSMContext):
         if not frames_to_search:
             return await msg.edit_text("❌ Не удалось извлечь кадры из файла.")
 
+        # Сначала пробуем найти аниме через trace.moe
         best_result = None
         best_similarity = 0
 
@@ -347,64 +370,87 @@ async def handle_anime_search(message: Message, state: FSMContext):
                         best_similarity = sim
                         best_result = res
 
-        if not best_result:
-            return await msg.edit_text("😔 <b>Ничего не найдено.</b>\n\nВозможно, это фанарт, AI-арт или кадр сильно обрезан.")
+        if best_result and best_similarity > 0.5:
+            # Нашли аниме
+            original_filename = best_result.get('filename', 'Неизвестно')
+            similarity = best_similarity * 100
+            
+            await msg.edit_text("🌐 <b>Перевожу название...</b>")
+            ru_title = await get_ru_title(best_result)
 
-        original_filename = best_result.get('filename', 'Неизвестно')
-        similarity = best_similarity * 100
+            warning = ""
+            if similarity < 85:
+                warning = "\n\n⚠️ <b>Внимание:</b> Схожесть низкая. Бот может ошибаться."
+
+            text = (
+                f"🎬 <b>Аниме:</b> {ru_title}\n"
+                f"📁 <b>Оригинал:</b> <code>{original_filename}</code>\n"
+                f"📺 <b>Серия:</b> {best_result.get('episode', '?')}\n"
+                f"⏱ <b>Таймкод:</b> {int(best_result.get('from', 0))} сек.\n"
+                f"📊 <b>Схожесть:</b> {similarity:.1f}%"
+                f"{warning}"
+            )
+            
+            cover_url = None
+            if best_result.get("anilist") and isinstance(best_result["anilist"], dict):
+                cover_url = best_result["anilist"].get("coverImage", {}).get("large")
+
+            if cover_url:
+                await message.answer_photo(cover_url, caption=text)
+            elif best_result.get("image"):
+                await message.answer_photo(best_result["image"], caption=text)
+            else:
+                await message.answer(text)
+
+            if best_result.get("video"):
+                try:
+                    await message.answer_video(best_result["video"], caption="🎬 Отрывок из аниме")
+                except Exception:
+                    pass
+            
+            await msg.delete()
+            return
+
+        # Если аниме не найдено, пробуем найти фильм/мультфильм
+        await msg.edit_text("🎬 <b>Аниме не найдено. Пробую найти фильм или мультфильм...</b>")
         
-        await msg.edit_text("🌐 <b>Перевожу название...</b>")
-        ru_title = await get_ru_title(best_result)
-
-        warning = ""
-        if similarity < 85:
-            warning = "\n\n⚠️ <b>Внимание:</b> Схожесть низкая. Бот может ошибаться."
-
-        text = (
-            f"🎬 <b>Аниме:</b> {ru_title}\n"
-            f"📁 <b>Оригинал:</b> <code>{original_filename}</code>\n"
-            f"📺 <b>Серия:</b> {best_result.get('episode', '?')}\n"
-            f"⏱ <b>Таймкод:</b> {int(best_result.get('from', 0))} сек.\n"
-            f"📊 <b>Схожесть:</b> {similarity:.1f}%"
-            f"{warning}"
-        )
+        movie_found = False
+        for img_data in frames_to_search:
+            result = await search_find_scene_api(img_data)
+            if result and not result.get("error"):
+                # Обработка ответа от find-scene
+                title = result.get("title") or result.get("movie_title")
+                year = result.get("year", "?")
+                if title:
+                    text = (
+                        f"🎬 <b>Найдено:</b> {title} ({year})\n\n"
+                        f"<i>Это может быть фильм или мультфильм.</i>"
+                    )
+                    await message.answer(text)
+                    movie_found = True
+                    break
         
-        # Отправляем обложку
-        cover_url = None
-        if best_result.get("anilist") and isinstance(best_result["anilist"], dict):
-            cover_url = best_result["anilist"].get("coverImage", {}).get("large")
-
-        if cover_url:
-            await message.answer_photo(cover_url, caption=text)
-        elif best_result.get("image"):
-            await message.answer_photo(best_result["image"], caption=text)
-        else:
-            await message.answer(text)
-
-        # Если есть видео-отрывок, отправляем и его
-        if best_result.get("video"):
-            try:
-                await message.answer_video(best_result["video"], caption="🎬 Отрывок из аниме")
-            except Exception:
-                pass # Игнорируем, если видео не отправилось
+        if not movie_found:
+            await msg.edit_text("😔 <b>Ничего не найдено.</b>\n\nВозможно, это фанарт, AI-арт или кадр сильно обрезан.")
         
         await msg.delete()
-        
+
     except Exception as e: 
         await msg.edit_text(f"❌ Ошибка: {e}")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-# ---------- ССЫЛКИ (АНИМЕ) ----------
-@router.message(UserStates.waiting_anime, F.text & F.text.regexp(r'https?://'))
-async def handle_anime_link(message: Message, state: FSMContext):
+# ---------- ССЫЛКИ (ПОИСК ПО ССЫЛКЕ) ----------
+@router.message(UserStates.waiting_media, F.text & F.text.regexp(r'https?://'))
+async def handle_media_link(message: Message, state: FSMContext):
     url = message.text.strip()
     if re.search(r'\.(jpg|jpeg|png|gif|webp)(\?|$)', url, re.I):
-        msg = await message.answer("🔍 <b>Ищу аниме по ссылке...</b>")
+        msg = await message.answer("🔍 <b>Ищу по ссылке...</b>")
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as resp:
                 if resp.status == 200:
                     img_data = await resp.read()
+                    # Сначала пробуем trace.moe
                     result = await search_tracemoe_api(img_data)
                     if result.get("result"):
                         best = result["result"][0]
@@ -415,40 +461,47 @@ async def handle_anime_link(message: Message, state: FSMContext):
                             f"📺 <b>Серия:</b> {best.get('episode', '?')}\n"
                             f"⏱ <b>Таймкод:</b> {int(best.get('from', 0))} сек."
                         )
-                    else:
-                        await msg.edit_text("😔 Ничего не найдено.")
+                        return
+                    
+                    # Если не аниме, пробуем find-scene
+                    movie_result = await search_find_scene_api(img_data)
+                    if movie_result and not movie_result.get("error"):
+                        title = movie_result.get("title")
+                        if title:
+                            await msg.edit_text(f"🎬 <b>Найдено:</b> {title}")
+                            return
+                    
+                    await msg.edit_text("😔 Ничего не найдено.")
                 else:
                     await msg.edit_text("❌ Не удалось загрузить изображение по ссылке.")
 
 # ---------- ПОИСК МУЗЫКИ (ПОЛНЫЙ ТРЕК) ----------
 async def search_music_api(query):
-    """Ищет трек через MusicAPI и возвращает ссылку на аудио."""
+    """Ищет и скачивает полный трек, используя yt-dlp (как lukidown)."""
     try:
-        # 1. Получаем ID песни
-        prepare_url = f"https://bhindi1.ddns.net/music/api/prepare/{urllib.parse.quote(query)}"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(prepare_url, timeout=10) as resp:
-                if resp.status != 200:
-                    return None
-                prepare_data = await resp.json()
-                song_id = prepare_data.get("id")
-                if not song_id:
-                    return None
-
-        # 2. Получаем данные по ID
-        fetch_url = f"https://bhindi1.ddns.net/music/api/fetch/{song_id}"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(fetch_url, timeout=10) as resp:
-                if resp.status != 200:
-                    return None
-                fetch_data = await resp.json()
-                # Ищем прямую ссылку на аудио
-                audio_url = fetch_data.get("audio_url")
-                title = fetch_data.get("title", query)
-                artist = fetch_data.get("artist", "Неизвестен")
-                if audio_url:
-                    return {"audio_url": audio_url, "title": title, "artist": artist}
-    except Exception:
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'outtmpl': '%(title)s.%(ext)s',
+            'quiet': True,
+            'no_warnings': True,
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"ytsearch1:{query}", download=True)
+            if 'entries' in info and info['entries']:
+                video = info['entries'][0]
+                title = video.get('title', 'Трек')
+                # Ищем скачанный mp3
+                for f in os.listdir('.'):
+                    if f.endswith('.mp3'):
+                        return os.path.abspath(f), title
+        return None
+    except Exception as e:
+        print(f"Music search error: {e}")
         return None
 
 @router.message(F.text == "🎵 Поиск музыки")
@@ -474,14 +527,15 @@ async def handle_music_text(message: Message, state: FSMContext):
     try:
         result = await search_music_api(query)
         if result:
+            file_path, title = result
             await msg.edit_text("✅ <b>Трек найден!</b> Отправляю...")
             await message.answer_audio(
-                audio=URLInputFile(result["audio_url"], filename=f"{result['artist']} - {result['title']}.mp3"),
-                title=result["title"],
-                performer=result["artist"],
-                caption=f"🎵 <b>{result['artist']} - {result['title']}</b>\n\n📥 Скачано через @{BOT_USERNAME}"
+                audio=FSInputFile(file_path),
+                title=title,
+                caption=f"🎵 <b>{title}</b>\n\n📥 Скачано через @{BOT_USERNAME}"
             )
             await msg.delete()
+            os.remove(file_path)
             return
         else:
             await msg.edit_text("😔 <b>Не удалось найти трек.</b>\nПопробуй изменить название.", reply_markup=back_inline_kb())
@@ -518,17 +572,17 @@ async def handle_music_media(message: Message, state: FSMContext):
         query = f"{track.subtitle} - {track.title}"
         result = await search_music_api(query)
         if result:
+            file_path, title = result
             await msg.edit_text("✅ <b>Трек найден!</b> Отправляю...")
             await message.answer_audio(
-                audio=URLInputFile(result["audio_url"], filename=f"{result['artist']} - {result['title']}.mp3"),
-                title=result["title"],
-                performer=result["artist"],
-                caption=f"🎵 <b>{result['artist']} - {result['title']}</b>\n\n📥 Скачано через @{BOT_USERNAME}"
+                audio=FSInputFile(file_path),
+                title=title,
+                caption=f"🎵 <b>{title}</b>\n\n📥 Скачано через @{BOT_USERNAME}"
             )
             await msg.delete()
+            os.remove(file_path)
             return
         else:
-            # Если полный трек не нашли, отправляем хотя бы информацию
             text = f"🎵 <b>{track.title}</b>\n👤 {track.subtitle}\n\n<i>Не удалось скачать полный трек, но я его распознал!</i>"
             kb = InlineKeyboardMarkup(inline_keyboard=[[btn("▶️ YouTube", url=track.youtube_link, style="danger")], [btn("◀️ Назад в меню", callback_data="main_menu", style="danger")]]) if track.youtube_link else back_inline_kb()
             await msg.edit_text(text, reply_markup=kb)
